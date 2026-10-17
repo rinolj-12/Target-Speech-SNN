@@ -7,7 +7,7 @@ and iSTFT Spectrogram Decoder with mixture phase).
 
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 from config import ModelConfig
 from encoder import SpectrogramEncoder
@@ -102,7 +102,8 @@ class SpikingConvTasNet(nn.Module):
         x: torch.Tensor,
         spk_embed: Optional[torch.Tensor] = None,
         verbose: Optional[bool] = None,
-    ) -> torch.Tensor:
+        return_intermediates: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Forward pass through STFT-based Spiking Conv-TasNet.
 
@@ -111,10 +112,11 @@ class SpikingConvTasNet(nn.Module):
                               Shape: [Batch, 1, Time] or [Batch, Time].
             spk_embed (torch.Tensor, optional): Target speaker voiceprint embedding [Batch, D_spk].
             verbose (bool, optional): If True, prints tensor shapes throughout the pipeline.
+            return_intermediates (bool, optional): If True, returns (separated_waveforms, masks, spike_seq).
 
         Returns:
-            torch.Tensor: Separated audio waveforms.
-                          Shape: [Batch, Num_Sources, Time]
+            torch.Tensor or Tuple: Separated audio waveforms [Batch, Num_Sources, Time]
+                                   or (separated_waveforms, masks, spike_seq).
         """
         if verbose is None:
             verbose = self.config.verbose_shapes
@@ -160,6 +162,9 @@ class SpikingConvTasNet(nn.Module):
         if verbose:
             print(f"6. Separated Output Waveforms   : {separated_waveforms.shape}")
             print("=" * 50 + "\n")
+
+        if return_intermediates:
+            return separated_waveforms, masks, spike_seq
 
         return separated_waveforms
 

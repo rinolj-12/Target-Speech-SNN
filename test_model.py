@@ -198,20 +198,29 @@ def run_sample_separation(
     emb1 = cache_mgr.get_embedding(spk1_id, reference_audio_path=p_s1).unsqueeze(0).to(device)
     emb2 = cache_mgr.get_embedding(spk2_id, reference_audio_path=p_s2).unsqueeze(0).to(device)
 
+    audio_dir = os.path.join(enc_output_dir, "audio")
+    waveform_dir = os.path.join(enc_output_dir, "waveforms")
+    spec_dir = os.path.join(enc_output_dir, "spectrograms")
+    mask_dir = os.path.join(enc_output_dir, "masks")
+    snn_dir = os.path.join(enc_output_dir, "snn")
+
+    for d in [audio_dir, waveform_dir, spec_dir, mask_dir, snn_dir]:
+        os.makedirs(d, exist_ok=True)
+
     with torch.no_grad():
-        # Pass 1: Extract Speaker 1 using Vector 1
-        est1 = model(x, spk_embed=emb1)[0, 0].cpu().numpy()
+        # Pass 1: Extract Speaker 1 using Vector 1 + intermediates
+        est1_out, mask1, spike_seq1 = model(x, spk_embed=emb1, return_intermediates=True)
+        est1 = est1_out[0, 0].cpu().numpy()
+
         # Pass 2: Extract Speaker 2 using Vector 2 from the EXACT same mixture!
-        est2 = model(x, spk_embed=emb2)[0, 0].cpu().numpy()
+        est2_out, mask2, _ = model(x, spk_embed=emb2, return_intermediates=True)
+        est2 = est2_out[0, 0].cpu().numpy()
 
     # Metrics
     in_sdr1 = calculate_sisdr(torch.from_numpy(mix_norm), torch.from_numpy(s1_norm)).item()
     out_sdr1 = calculate_sisdr(torch.from_numpy(est1), torch.from_numpy(s1_norm)).item()
     in_sdr2 = calculate_sisdr(torch.from_numpy(mix_norm), torch.from_numpy(s2_norm)).item()
     out_sdr2 = calculate_sisdr(torch.from_numpy(est2), torch.from_numpy(s2_norm)).item()
-
-    audio_dir = os.path.join(enc_output_dir, "audio")
-    os.makedirs(audio_dir, exist_ok=True)
 
     sf.write(os.path.join(audio_dir, "mixture.wav"), mix_norm, sr)
     sf.write(os.path.join(audio_dir, "target_speaker1_clean.wav"), s1_norm, sr)
@@ -224,11 +233,15 @@ def run_sample_separation(
     print(f"  - Extracted Spk 1 (via Vec 1): {os.path.join(audio_dir, 'extracted_speaker1.wav')} (SI-SDRi: {out_sdr1 - in_sdr1:+.2f} dB)")
     print(f"  - Extracted Spk 2 (via Vec 2): {os.path.join(audio_dir, 'extracted_speaker2.wav')} (SI-SDRi: {out_sdr2 - in_sdr2:+.2f} dB)")
 
-    # Visualizations
+    # Visualizations in dedicated subfolders
     targets_2d = np.stack([s1_norm, s2_norm], axis=0)
     estimates_2d = np.stack([est1, est2], axis=0)
-    save_separate_waveforms(mix_norm, targets_2d, estimates_2d, sr, enc_output_dir)
-    save_separate_spectrograms(mix_norm, targets_2d, estimates_2d, sr, enc_output_dir)
+    save_separate_waveforms(mix_norm, targets_2d, estimates_2d, sr, output_dir=waveform_dir)
+    save_separate_spectrograms(mix_norm, targets_2d, estimates_2d, sr, output_dir=spec_dir)
+    stacked_masks = torch.cat([mask1, mask2], dim=1)
+    save_separate_mask_plots(stacked_masks, output_dir=mask_dir)
+    if spike_seq1 is not None:
+        save_separate_snn_raster_plots(spike_seq1, output_dir=snn_dir)
 
 
 def run_multitalker_test(

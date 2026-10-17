@@ -18,6 +18,9 @@
 # Spiking Neural Network framework (must match your torch version)
 snntorch>=1.0.0
 
+# Speaker Verification & Voiceprint Extraction (ECAPA-TDNN)
+speechbrain>=1.0.0
+
 # Numerical & Scientific
 numpy>=1.24.0
 scipy>=1.10.0

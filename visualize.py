@@ -340,37 +340,55 @@ def plot_mask_analysis(
         masks = masks[0]
 
     m_np = masks.detach().cpu().numpy()
-    m1 = m_np[0]
-    m2 = m_np[1]
-    m_diff = m1 - m2
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+    if m_np.shape[0] == 1:
+        m1 = m_np[0]
+        fig, axes = plt.subplots(1, 2, figsize=(14, 4))
 
-    im0 = axes[0, 0].imshow(m1, aspect="auto", cmap="viridis", interpolation="nearest")
-    axes[0, 0].set_title(f"Speaker 1 Mask M_1 {title_suffix}".strip(), fontsize=11, fontweight="bold")
-    axes[0, 0].set_ylabel("Latent Channel (N)")
-    axes[0, 0].set_xlabel("Latent Time Frame (L)")
-    plt.colorbar(im0, ax=axes[0, 0], label="Mask Value")
+        im0 = axes[0].imshow(m1, aspect="auto", cmap="viridis", interpolation="nearest")
+        axes[0].set_title(f"Target Latent Mask M {title_suffix}".strip(), fontsize=11, fontweight="bold")
+        axes[0].set_ylabel("Latent Channel (N)")
+        axes[0].set_xlabel("Latent Time Frame (L)")
+        plt.colorbar(im0, ax=axes[0], label="Mask Value")
 
-    im1 = axes[0, 1].imshow(m2, aspect="auto", cmap="viridis", interpolation="nearest")
-    axes[0, 1].set_title(f"Speaker 2 Mask M_2 {title_suffix}".strip(), fontsize=11, fontweight="bold")
-    axes[0, 1].set_ylabel("Latent Channel (N)")
-    axes[0, 1].set_xlabel("Latent Time Frame (L)")
-    plt.colorbar(im1, ax=axes[0, 1], label="Mask Value")
+        axes[1].hist(m1.flatten(), bins=40, alpha=0.7, color=COLOR_SPK1_TGT, label="Mask Values", density=True)
+        axes[1].set_title("Mask Value Distribution", fontsize=11, fontweight="bold")
+        axes[1].set_xlabel("Mask Value")
+        axes[1].set_ylabel("Density")
+        axes[1].legend(loc="upper right")
+        axes[1].grid(True, alpha=0.3)
+    else:
+        m1 = m_np[0]
+        m2 = m_np[1]
+        m_diff = m1 - m2
 
-    im2 = axes[1, 0].imshow(m_diff, aspect="auto", cmap="coolwarm", interpolation="nearest")
-    axes[1, 0].set_title("Mask Contrast (M_1 - M_2): Blue=Spk2, Red=Spk1", fontsize=11, fontweight="bold")
-    axes[1, 0].set_ylabel("Latent Channel (N)")
-    axes[1, 0].set_xlabel("Latent Time Frame (L)")
-    plt.colorbar(im2, ax=axes[1, 0], label="Contrast")
+        fig, axes = plt.subplots(2, 2, figsize=(14, 8))
 
-    axes[1, 1].hist(m1.flatten(), bins=40, alpha=0.6, color=COLOR_SPK1_TGT, label="M_1 Values", density=True)
-    axes[1, 1].hist(m2.flatten(), bins=40, alpha=0.6, color=COLOR_SPK1_EST, label="M_2 Values", density=True)
-    axes[1, 1].set_title("Mask Value Distribution", fontsize=11, fontweight="bold")
-    axes[1, 1].set_xlabel("Mask Value")
-    axes[1, 1].set_ylabel("Density")
-    axes[1, 1].legend(loc="upper right")
-    axes[1, 1].grid(True, alpha=0.3)
+        im0 = axes[0, 0].imshow(m1, aspect="auto", cmap="viridis", interpolation="nearest")
+        axes[0, 0].set_title(f"Speaker 1 Mask M_1 {title_suffix}".strip(), fontsize=11, fontweight="bold")
+        axes[0, 0].set_ylabel("Latent Channel (N)")
+        axes[0, 0].set_xlabel("Latent Time Frame (L)")
+        plt.colorbar(im0, ax=axes[0, 0], label="Mask Value")
+
+        im1 = axes[0, 1].imshow(m2, aspect="auto", cmap="viridis", interpolation="nearest")
+        axes[0, 1].set_title(f"Speaker 2 Mask M_2 {title_suffix}".strip(), fontsize=11, fontweight="bold")
+        axes[0, 1].set_ylabel("Latent Channel (N)")
+        axes[0, 1].set_xlabel("Latent Time Frame (L)")
+        plt.colorbar(im1, ax=axes[0, 1], label="Mask Value")
+
+        im2 = axes[1, 0].imshow(m_diff, aspect="auto", cmap="coolwarm", interpolation="nearest")
+        axes[1, 0].set_title("Mask Contrast (M_1 - M_2): Blue=Spk2, Red=Spk1", fontsize=11, fontweight="bold")
+        axes[1, 0].set_ylabel("Latent Channel (N)")
+        axes[1, 0].set_xlabel("Latent Time Frame (L)")
+        plt.colorbar(im2, ax=axes[1, 0], label="Contrast")
+
+        axes[1, 1].hist(m1.flatten(), bins=40, alpha=0.6, color=COLOR_SPK1_TGT, label="M_1 Values", density=True)
+        axes[1, 1].hist(m2.flatten(), bins=40, alpha=0.6, color=COLOR_SPK1_EST, label="M_2 Values", density=True)
+        axes[1, 1].set_title("Mask Value Distribution", fontsize=11, fontweight="bold")
+        axes[1, 1].set_xlabel("Mask Value")
+        axes[1, 1].set_ylabel("Density")
+        axes[1, 1].legend(loc="upper right")
+        axes[1, 1].grid(True, alpha=0.3)
 
     plt.tight_layout()
     if save_path:
@@ -402,63 +420,93 @@ def save_separate_mask_plots(
         masks = masks[0]
 
     m_np = masks.detach().cpu().numpy()
-    m1 = m_np[0]
-    m2 = m_np[1]
-    m_diff = m1 - m2
 
-    # 1. Mask M1
-    fig, ax = plt.subplots(figsize=(8, 4))
-    im = ax.imshow(m1, aspect="auto", cmap="viridis", interpolation="nearest")
-    ax.set_title(f"Speaker 1 Latent Mask M_1 {title_suffix}".strip(), fontsize=11, fontweight="bold")
-    ax.set_ylabel("Latent Channel (N)")
-    ax.set_xlabel("Latent Time Frame (L)")
-    plt.colorbar(im, ax=ax, label="Mask Value")
-    p1 = os.path.join(output_dir, "mask_speaker1.png")
-    fig.tight_layout()
-    fig.savefig(p1, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    saved_paths["mask_spk1"] = p1
+    if m_np.shape[0] == 1:
+        m1 = m_np[0]
+        # 1. Target Mask
+        fig, ax = plt.subplots(figsize=(8, 4))
+        im = ax.imshow(m1, aspect="auto", cmap="viridis", interpolation="nearest")
+        ax.set_title(f"Target Latent Mask M {title_suffix}".strip(), fontsize=11, fontweight="bold")
+        ax.set_ylabel("Latent Channel (N)")
+        ax.set_xlabel("Latent Time Frame (L)")
+        plt.colorbar(im, ax=ax, label="Mask Value")
+        p1 = os.path.join(output_dir, "mask_speaker1.png")
+        fig.tight_layout()
+        fig.savefig(p1, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved_paths["mask_spk1"] = p1
 
-    # 2. Mask M2
-    fig, ax = plt.subplots(figsize=(8, 4))
-    im = ax.imshow(m2, aspect="auto", cmap="viridis", interpolation="nearest")
-    ax.set_title(f"Speaker 2 Latent Mask M_2 {title_suffix}".strip(), fontsize=11, fontweight="bold")
-    ax.set_ylabel("Latent Channel (N)")
-    ax.set_xlabel("Latent Time Frame (L)")
-    plt.colorbar(im, ax=ax, label="Mask Value")
-    p2 = os.path.join(output_dir, "mask_speaker2.png")
-    fig.tight_layout()
-    fig.savefig(p2, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    saved_paths["mask_spk2"] = p2
+        # 2. Distribution
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.hist(m1.flatten(), bins=40, alpha=0.7, color=COLOR_SPK1_TGT, label="Mask Values", density=True)
+        ax.set_title(f"Mask Value Distribution Histogram {title_suffix}".strip(), fontsize=11, fontweight="bold")
+        ax.set_xlabel("Mask Value")
+        ax.set_ylabel("Density")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+        p4 = os.path.join(output_dir, "mask_distribution.png")
+        fig.tight_layout()
+        fig.savefig(p4, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved_paths["mask_dist"] = p4
+    else:
+        m1 = m_np[0]
+        m2 = m_np[1]
+        m_diff = m1 - m2
 
-    # 3. Mask Contrast
-    fig, ax = plt.subplots(figsize=(8, 4))
-    im = ax.imshow(m_diff, aspect="auto", cmap="coolwarm", interpolation="nearest")
-    ax.set_title(f"Mask Contrast (M_1 - M_2): Blue=Spk2, Red=Spk1 {title_suffix}".strip(), fontsize=11, fontweight="bold")
-    ax.set_ylabel("Latent Channel (N)")
-    ax.set_xlabel("Latent Time Frame (L)")
-    plt.colorbar(im, ax=ax, label="Contrast Value")
-    p3 = os.path.join(output_dir, "mask_contrast.png")
-    fig.tight_layout()
-    fig.savefig(p3, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    saved_paths["mask_contrast"] = p3
+        # 1. Mask M1
+        fig, ax = plt.subplots(figsize=(8, 4))
+        im = ax.imshow(m1, aspect="auto", cmap="viridis", interpolation="nearest")
+        ax.set_title(f"Speaker 1 Latent Mask M_1 {title_suffix}".strip(), fontsize=11, fontweight="bold")
+        ax.set_ylabel("Latent Channel (N)")
+        ax.set_xlabel("Latent Time Frame (L)")
+        plt.colorbar(im, ax=ax, label="Mask Value")
+        p1 = os.path.join(output_dir, "mask_speaker1.png")
+        fig.tight_layout()
+        fig.savefig(p1, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved_paths["mask_spk1"] = p1
 
-    # 4. Mask Distribution Histogram
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.hist(m1.flatten(), bins=40, alpha=0.6, color=COLOR_SPK1_TGT, label="M_1 Values", density=True)
-    ax.hist(m2.flatten(), bins=40, alpha=0.6, color=COLOR_SPK1_EST, label="M_2 Values", density=True)
-    ax.set_title(f"Mask Value Distribution Histogram {title_suffix}".strip(), fontsize=11, fontweight="bold")
-    ax.set_xlabel("Mask Value")
-    ax.set_ylabel("Density")
-    ax.legend(loc="upper right")
-    ax.grid(True, alpha=0.3)
-    p4 = os.path.join(output_dir, "mask_distribution.png")
-    fig.tight_layout()
-    fig.savefig(p4, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    saved_paths["mask_dist"] = p4
+        # 2. Mask M2
+        fig, ax = plt.subplots(figsize=(8, 4))
+        im = ax.imshow(m2, aspect="auto", cmap="viridis", interpolation="nearest")
+        ax.set_title(f"Speaker 2 Latent Mask M_2 {title_suffix}".strip(), fontsize=11, fontweight="bold")
+        ax.set_ylabel("Latent Channel (N)")
+        ax.set_xlabel("Latent Time Frame (L)")
+        plt.colorbar(im, ax=ax, label="Mask Value")
+        p2 = os.path.join(output_dir, "mask_speaker2.png")
+        fig.tight_layout()
+        fig.savefig(p2, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved_paths["mask_spk2"] = p2
+
+        # 3. Mask Contrast
+        fig, ax = plt.subplots(figsize=(8, 4))
+        im = ax.imshow(m_diff, aspect="auto", cmap="coolwarm", interpolation="nearest")
+        ax.set_title(f"Mask Contrast (M_1 - M_2): Blue=Spk2, Red=Spk1 {title_suffix}".strip(), fontsize=11, fontweight="bold")
+        ax.set_ylabel("Latent Channel (N)")
+        ax.set_xlabel("Latent Time Frame (L)")
+        plt.colorbar(im, ax=ax, label="Contrast Value")
+        p3 = os.path.join(output_dir, "mask_contrast.png")
+        fig.tight_layout()
+        fig.savefig(p3, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved_paths["mask_contrast"] = p3
+
+        # 4. Mask Distribution Histogram
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.hist(m1.flatten(), bins=40, alpha=0.6, color=COLOR_SPK1_TGT, label="M_1 Values", density=True)
+        ax.hist(m2.flatten(), bins=40, alpha=0.6, color=COLOR_SPK1_EST, label="M_2 Values", density=True)
+        ax.set_title(f"Mask Value Distribution Histogram {title_suffix}".strip(), fontsize=11, fontweight="bold")
+        ax.set_xlabel("Mask Value")
+        ax.set_ylabel("Density")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+        p4 = os.path.join(output_dir, "mask_distribution.png")
+        fig.tight_layout()
+        fig.savefig(p4, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved_paths["mask_dist"] = p4
 
     # 5. Summary Grid
     p_summary = os.path.join(output_dir, "mask_analysis_summary.png")

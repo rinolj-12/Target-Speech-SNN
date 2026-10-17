@@ -7,6 +7,7 @@ and an automatic LRU/file memoization cache so extraction overhead is near zero 
 """
 
 import os
+import atexit
 import argparse
 from typing import Dict, Optional, Union
 import torch
@@ -123,6 +124,7 @@ class SpeakerCacheManager:
                 print(f"[SpeakerCache] Warning: Could not load {cache_file}: {e}")
 
         self._modified_count = 0
+        atexit.register(self.save)
 
     @property
     def encoder(self) -> SpeakerEncoder:
@@ -162,10 +164,14 @@ class SpeakerCacheManager:
         return emb
 
     def save(self):
-        """Persists current cache to disk."""
-        if len(self.cache) > 0 and self.cache_file:
-            os.makedirs(os.path.dirname(os.path.abspath(self.cache_file)), exist_ok=True)
-            torch.save(self.cache, self.cache_file)
+        """Persists current cache to disk if modified."""
+        if len(self.cache) > 0 and self.cache_file and self._modified_count > 0:
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(self.cache_file)), exist_ok=True)
+                torch.save(self.cache, self.cache_file)
+                self._modified_count = 0
+            except Exception as e:
+                print(f"[SpeakerCache] Warning: Could not save cache to {self.cache_file}: {e}")
 
 
 # Global singleton instance helper

@@ -213,7 +213,7 @@ class TSECombinedLoss(nn.Module):
         if self.mr_stft_loss is not None and self.mr_stft_weight > 0:
             est_flat = estimate.squeeze(1) if estimate.dim() == 3 and estimate.size(1) == 1 else estimate
             tgt_flat = target.squeeze(1) if target.dim() == 3 and target.size(1) == 1 else target
-            stft_loss = self.mr_stft_loss(est_flat, tgt_flat)
+            stft_loss = self.mr_stft_loss(est_flat, tgt_flat).mean()
             total_loss = loss_sisdr + self.mr_stft_weight * stft_loss
         else:
             total_loss = loss_sisdr
