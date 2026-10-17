@@ -36,8 +36,8 @@
 ### Step 1 — Clone & Create Environment
 
 ```bash
-git clone <your-repo-url>
-cd Speech
+git clone https://github.com/rinolj-12/Target-Speech-SNN.git
+cd Target-Speech-SNN
 python -m venv .venv
 ```
 
@@ -100,14 +100,14 @@ python scripts/setup_data.py --with_noise       # Libri2Mix + WHAM! Noise
 python train.py --device cpu --no_amp --batch_size 2 --mixture_type mix_clean
 ```
 
-**🟢 GPU — MiniLibriMix:**
+**🟢 GPU — MiniLibriMix (~580 MB, ~1,000 pairs):**
 ```bash
-python train.py --device cuda --dataset_type mini_librimix --data_dir ./data/MiniLibriMix --mixture_type mix_clean
+python train.py --device cuda --dataset_type mini_librimix --data_dir ./data/MiniLibriMix --mixture_type mix_clean --batch_size 4 --grad_accum_steps 4 --epochs 70
 ```
 
-**🟢 GPU — Full Libri2Mix:**
+**🟢 GPU — Full Libri2Mix (~13,900 pairs):**
 ```bash
-python train.py --device cuda --mixture_type mix_clean --data_dir ./data/Libri2Mix
+python train.py --device cuda --dataset_type librimix --data_dir ./data/Libri2Mix --mixture_type mix_clean --batch_size 4 --grad_accum_steps 4 --epochs 70
 ```
 
 > [!TIP]
@@ -118,12 +118,18 @@ python train.py --device cuda --mixture_type mix_clean --data_dir ./data/Libri2M
 
 ### Step 5 — Test & Extract
 
+**🟢 GPU Evaluation & Multi-Talker Cocktail Party Test:**
 ```bash
-# Evaluate on validation set + run 3-speaker cocktail party test, extract Speaker #1
-python test_model.py --device cpu --num_talkers 3 --target_talker 0
+# Evaluate on validation set + extract Speaker #1 from 3 overlapping speakers
+python test_model.py --device cuda --num_talkers 3 --target_talker 0
 
 # Extract a specific target from 4 overlapping speakers
-python test_model.py --device cpu --num_talkers 4 --target_talker 2
+python test_model.py --device cuda --num_talkers 4 --target_talker 2
+```
+
+**🔵 CPU Evaluation:**
+```bash
+python test_model.py --device cpu --num_talkers 3 --target_talker 0
 ```
 
 ---
