@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """
-Cross-Platform Libri2Mix train-100 (8 kHz) Data Generator.
+Speech Separation Dataset Setup & Generator.
 Compatible with Windows 11, Ubuntu Linux, and macOS.
 
-Features:
-1. Generates official Libri2Mix train-100 (8 kHz, min mode).
-2. Interactive prompt: choose clean-only (~6.3 GB) OR clean + noisy (~23 GB).
-3. Pure Python downloads and extraction (tarfile + zipfile; no OS-specific tools).
-4. Detects OS and provides tailored SoX installation instructions.
-5. Auto-invokes generation via the active Python virtual environment.
+Supports 3 Dataset Options:
+  1. MiniLibriMix: Pre-mixed lightweight subset (~580 MB download, ~750 MB disk).
+     Instant setup, no heavy generation or SoX required.
+  2. Libri2Mix Clean: Full train-clean-100 benchmark (~6.3 GB download, ~10-12 GB disk).
+     Generates clean 2-speaker speech mixtures (mix_clean) @ 8 kHz via SoX.
+  3. Libri2Mix Both: Full benchmark with clean & realistic noise mixtures (~24 GB downloads, ~25-35 GB disk).
+     Downloads LibriSpeech + WHAM! background noise and generates mix_clean and mix_both.
 
 Usage:
-    # Interactive (recommended):
-    python scripts/setup_data.py
+  # Interactive menu (recommended):
+  python scripts/setup_data.py
 
-    # Non-interactive flags:
-    python scripts/setup_data.py --with_noise      # clean + noisy mixtures
-    python scripts/setup_data.py --clean_only      # clean mixtures, skip WHAM! download
-    python scripts/setup_data.py --storage_dir /mnt/data  # custom storage location
+  # Direct command-line flags:
+  python scripts/setup_data.py --mini             # Setup MiniLibriMix (~750 MB)
+  python scripts/setup_data.py --clean_only       # Generate Libri2Mix Clean (~11 GB)
+  python scripts/setup_data.py --with_noise       # Generate Libri2Mix Clean + Noisy (~30 GB)
+  python scripts/setup_data.py --storage_dir /path/to/external_drive
 """
 
 import os
@@ -31,10 +33,26 @@ import argparse
 from pathlib import Path
 
 
+# Zenodo URLs for MiniLibriMix
+_MINI_LIBRIMIX_URLS = [
+    "https://zenodo.org/records/3871592/files/MiniLibriMix.zip?download=1",
+    "https://zenodo.org/record/3871592/files/MiniLibriMix.zip",
+]
+
+
 def print_banner(msg: str):
     print("\n" + "=" * 68)
     print(f"  {msg}")
     print("=" * 68)
+
+
+def get_disk_free_gb(path: Path) -> float:
+    """Returns free space in GB on the filesystem containing path."""
+    try:
+        usage = shutil.disk_usage(str(path))
+        return usage.free / (1024 ** 3)
+    except Exception:
+        return 0.0
 
 
 def check_sox():
@@ -56,13 +74,11 @@ def check_sox():
 
     if not sox_path:
         print("\n[ERROR] 'sox' (Sound eXchange) was not found on your system PATH.")
-        print("  SoX is required to resample and mix audio at 8 kHz.")
+        print("  SoX is required to resample and mix audio at 8 kHz for full Libri2Mix.")
         if sys.platform == "win32":
             print("  Windows 11 Installation Options:")
             print("    1. via Winget:      winget install -e --id SoX.SoX")
             print("    2. via Chocolatey:  choco install sox")
-            print("    3. Download binary: https://sourceforge.net/projects/sox/files/sox/")
-            print("       then add the SoX folder to your system PATH.")
         elif sys.platform == "darwin":
             print("  macOS Installation:")
             print("    brew install sox")
@@ -126,102 +142,109 @@ def extract_archive(archive_path: Path, extract_dir: Path):
     archive_path.unlink()  # free disk space after extraction
 
 
-def prompt_noise_choice(storage_path: Path) -> bool:
-    """
-    Interactively asks whether to include WHAM! background noise in the mixtures.
+def setup_minilibrimix(storage_path: Path):
+    """Downloads and extracts the official MiniLibriMix dataset from Zenodo."""
+    print_banner("Setting up MiniLibriMix (~580 MB)")
+    out_dir = storage_path / "MiniLibriMix"
+    zip_path = storage_path / "MiniLibriMix.zip"
 
-    Returns:
-        True  → download WHAM! noise and generate both mix_clean + mix_both
-        False → skip WHAM! and generate mix_clean only
+    # Check if already present
+    has_audio = False
+    if out_dir.exists():
+        for r, _, files in os.walk(out_dir):
+            if any(f.endswith((".wav", ".flac")) for f in files):
+                has_audio = True
+                break
+    if has_audio:
+        print(f"  [OK] MiniLibriMix already present at: {out_dir}")
+        return out_dir
+
+    print(f"  Destination directory: {storage_path}")
+    download_success = False
+    for url in _MINI_LIBRIMIX_URLS:
+        try:
+            download_file(url, zip_path)
+            download_success = True
+            break
+        except Exception as e:
+            print(f"  [Warning] Download failed ({e}), trying fallback mirror...")
+
+    if not download_success or not zip_path.exists():
+        raise RuntimeError(f"Could not download MiniLibriMix from Zenodo mirrors.")
+
+    extract_archive(zip_path, storage_path)
+    print(f"  [OK] MiniLibriMix ready at: {out_dir}")
+    return out_dir
+
+
+def prompt_dataset_choice(storage_path: Path) -> str:
     """
-    # Check if WHAM! is already present (previous partial run)
-    wham_check_1 = storage_path / "wham_noise" / "wham_noise"
-    wham_check_2 = storage_path / "wham_noise"
-    already_have_wham = wham_check_1.exists() or (
-        wham_check_2.exists() and any(wham_check_2.iterdir())
-    )
-    if already_have_wham:
-        print("  [OK] WHAM! noise already downloaded — will generate both mix_clean & mix_both.")
-        return True
+    Displays interactive menu showing choices and current free disk space.
+    Returns: 'mini', 'clean', or 'both'
+    """
+    free_gb = get_disk_free_gb(storage_path)
 
     print()
     print("=" * 68)
-    print("  Mixture Type — choose what to generate:")
+    print("  Speech Separation Dataset Setup — Choose what to install/generate:")
     print("=" * 68)
+    print(f"  Target Storage:   {storage_path}")
+    print(f"  Free Disk Space:  {free_gb:.1f} GB available")
+    print("-" * 68)
     print()
-    print("  [1] Clean only  (mix_clean)                  ~6.3 GB total")
-    print("      Two speakers mixed together, no background noise.")
-    print("      Faster download. Good for first experiments.")
+    print("  [1] MiniLibriMix  (~580 MB download, ~750 MB disk space)")
+    print("      • Pre-mixed 2-speaker speech subset (800 train + 200 val pairs @ 8 kHz).")
+    print("      • Instant download & extraction — no SoX or audio generation needed.")
+    print("      • Best for: Fast sanity checks, debugging, and limited disk space.")
     print()
-    print("  [2] Clean + Noisy  (mix_clean & mix_both)    ~23 GB total")
-    print("      Same as above PLUS a noisy version with real background")
-    print("      noise from the WHAM! dataset (adds ~17 GB WHAM! download).")
-    print("      Needed for the default --mixture_type mix_both training.")
+    print("  [2] Libri2Mix Clean  (~6.3 GB download, ~10-12 GB disk space)")
+    print("      • Standard benchmark on LibriSpeech train-clean-100 (~13,900 mixtures).")
+    print("      • Clean 2-speaker speech mixtures (mix_clean) @ 8 kHz generated via SoX.")
+    print("      • Standard academic baseline without noise. Fits within ~16 GB disk space.")
+    print()
+    print("  [3] Libri2Mix Both / Noisy  (~24 GB downloads, ~25-35 GB disk space)")
+    print("      • Full benchmark: clean speech (mix_clean) PLUS realistic background noise (mix_both)")
+    print("      • Downloads LibriSpeech (~7 GB) + WHAM! ambient noise (~17.6 GB) from Zenodo.")
+    if free_gb < 25.0:
+        print(f"      • ⚠️ WARNING: Requires ~25-35 GB space, but only {free_gb:.1f} GB is free!")
     print()
 
-    # Non-interactive environments default to clean-only (safe, smaller)
     if not sys.stdin.isatty():
-        print("  [Non-interactive mode] Defaulting to option 1 (clean only).")
-        return False
+        print("  [Non-interactive mode] Defaulting to Option 1 (MiniLibriMix).")
+        return "mini"
 
-    try:
-        choice = input("  Enter choice [1/2] (default 1 – clean only): ").strip() or "1"
-    except (EOFError, KeyboardInterrupt):
-        print()
-        choice = "1"
+    while True:
+        try:
+            choice = input("  Enter choice [1/2/3] (default 2 – Libri2Mix Clean): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "clean"
 
-    return choice.strip() == "2"
+        if choice in ["", "2"]:
+            return "clean"
+        elif choice == "1":
+            return "mini"
+        elif choice == "3":
+            if free_gb < 25.0:
+                print(f"\n  [CAUTION] You only have {free_gb:.1f} GB free on {storage_path}.")
+                print("  Libri2Mix with WHAM! noise typically requires at least 25-35 GB.")
+                confirm = input("  Are you sure you want to proceed? [y/N]: ").strip().lower()
+                if confirm != "y":
+                    continue
+            return "both"
+        else:
+            print("  Invalid choice. Please enter 1, 2, or 3.")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Generate Libri2Mix train-100 (8 kHz) — cross-platform setup",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python scripts/setup_data.py                    # interactive prompt
-  python scripts/setup_data.py --clean_only       # no WHAM! noise (~6.3 GB)
-  python scripts/setup_data.py --with_noise       # include WHAM! noise (~23 GB)
-  python scripts/setup_data.py --storage_dir /mnt/data --clean_only
-        """,
-    )
-    parser.add_argument(
-        "--storage_dir",
-        type=str,
-        default="./data",
-        help="Directory where all data will be stored (default: ./data)",
-    )
+def setup_libri2mix(storage_path: Path, want_noise: bool):
+    """Sets up SoX, clones LibriMix generator, downloads LibriSpeech/WHAM!, and generates mixtures."""
+    print_banner(f"Setting up Full Libri2Mix ({'Clean + Noisy' if want_noise else 'Clean Only'})")
 
-    # Noise mode — mutually exclusive flags
-    noise_group = parser.add_mutually_exclusive_group()
-    noise_group.add_argument(
-        "--clean_only",
-        action="store_true",
-        help="Generate clean mixtures only (mix_clean). Skips 17 GB WHAM! download.",
-    )
-    noise_group.add_argument(
-        "--with_noise",
-        action="store_true",
-        help="Download WHAM! noise (~17 GB) and generate both mix_clean and mix_both.",
-    )
-    # Keep --skip_wham as a hidden alias for --clean_only (backwards compat)
-    noise_group.add_argument("--skip_wham", action="store_true", help=argparse.SUPPRESS)
-
-    args = parser.parse_args()
-
-    storage_path = Path(args.storage_dir).resolve()
-    storage_path.mkdir(parents=True, exist_ok=True)
-
-    print_banner("Libri2Mix train-100 (8 kHz) — Cross-Platform Setup")
-    print(f"  OS:               {sys.platform.capitalize()} ({os.name})")
-    print(f"  Storage:          {storage_path}")
-    print(f"  Output dataset:   {storage_path / 'Libri2Mix'}")
-
-    # ── Step 1: SoX ─────────────────────────────────────────────────────────
+    # 1. Audio Tools
     print("\n[1/4] Checking audio tools...")
     check_sox()
 
-    # ── Step 2: LibriMix generator repo ─────────────────────────────────────
+    # 2. Generator Repo
     print("\n[2/4] Setting up LibriMix generator...")
     generator_dir = storage_path / "LibriMix_generator"
     if not generator_dir.exists():
@@ -232,28 +255,15 @@ Examples:
     else:
         print(f"  [OK] Generator repo exists at: {generator_dir}")
 
-    # Install generator dependencies into current environment
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install", "--quiet", "pandas", "soundfile", "scipy", "numpy"]
     )
 
-    # ── Step 3: Resolve noise preference ────────────────────────────────────
-    # Priority: --with_noise > --clean_only / --skip_wham > interactive prompt
-    if args.with_noise:
-        want_noise = True
-        print("\n  [--with_noise] Will download WHAM! noise and generate mix_clean + mix_both.")
-    elif args.clean_only or args.skip_wham:
-        want_noise = False
-        print("\n  [--clean_only] Skipping WHAM! noise. Will generate mix_clean only.")
-    else:
-        want_noise = prompt_noise_choice(storage_path)
-
-    # ── Step 4: Download LibriSpeech ────────────────────────────────────────
+    # 3. Download LibriSpeech
     print("\n[3/4] Downloading LibriSpeech source audio...")
     librispeech_dir = storage_path / "LibriSpeech"
     librispeech_dir.mkdir(parents=True, exist_ok=True)
 
-    # train-clean-100 (~6.3 GB), dev-clean (~337 MB), test-clean (~346 MB)
     sources = [
         ("http://www.openslr.org/resources/12/dev-clean.tar.gz",        librispeech_dir / "dev-clean"),
         ("http://www.openslr.org/resources/12/test-clean.tar.gz",       librispeech_dir / "test-clean"),
@@ -268,7 +278,7 @@ Examples:
         else:
             print(f"  [OK] Found {check_dir.name}")
 
-    # ── Step 5: Optionally download WHAM! noise ──────────────────────────────
+    # 4. Download WHAM! noise if requested
     wham_check_1 = storage_path / "wham_noise" / "wham_noise"
     wham_check_2 = storage_path / "wham_noise"
     has_wham = wham_check_1.exists() or (wham_check_2.exists() and any(wham_check_2.iterdir()))
@@ -276,8 +286,7 @@ Examples:
     if want_noise and not has_wham:
         wham_zip = storage_path / "wham_noise.zip"
         wham_url = "https://zenodo.org/records/3338999/files/wham_noise.zip?download=1"
-        print(f"\n  Downloading WHAM! noise from Zenodo (~17 GB)...")
-        print(f"  URL: {wham_url}")
+        print(f"\n  Downloading WHAM! noise from Zenodo (~17.6 GB)...")
         try:
             download_file(wham_url, wham_zip)
             extract_archive(wham_zip, storage_path)
@@ -290,9 +299,9 @@ Examples:
 
     wham_dir = wham_check_1 if wham_check_1.exists() else wham_check_2
 
-    # ── Step 6: Generate Libri2Mix ───────────────────────────────────────────
+    # 5. Generate Libri2Mix
     types_to_generate = ["mix_clean", "mix_both"] if has_wham else ["mix_clean"]
-    print(f"\n[4/4] Generating Libri2Mix ({' & '.join(types_to_generate)} @ 8 kHz)...")
+    print(f"\n[4/4] Generating Libri2Mix ({' & '.join(types_to_generate)} @ 8 kHz via SoX)...")
     librimix_outdir = storage_path / "Libri2Mix"
 
     metadata_dir  = generator_dir / "metadata" / "Libri2Mix"
@@ -311,24 +320,89 @@ Examples:
         "--types",  *types_to_generate,
     ]
 
-    print(f"  Running: {' '.join(cmd)}\n")
+    print(f"  Running generation script: {' '.join(cmd)}\n")
     subprocess.check_call(cmd, cwd=str(generator_dir), env=os.environ.copy())
 
-    # ── Done ─────────────────────────────────────────────────────────────────
     print_banner("Libri2Mix Generation Completed Successfully!")
     print(f"  Location: {librimix_outdir}")
     print(f"  Types:    {', '.join(types_to_generate)}")
+    return librimix_outdir, ("mix_both" if has_wham else "mix_clean")
 
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Setup Audio Datasets for Speech Separation (MiniLibriMix / Libri2Mix)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python scripts/setup_data.py                    # Interactive menu
+  python scripts/setup_data.py --mini             # Setup MiniLibriMix (~750 MB)
+  python scripts/setup_data.py --clean_only       # Generate Libri2Mix Clean (~11 GB)
+  python scripts/setup_data.py --with_noise       # Generate Libri2Mix Clean + Noisy (~30 GB)
+  python scripts/setup_data.py --storage_dir /mnt/data --clean_only
+        """,
+    )
+    parser.add_argument(
+        "--storage_dir",
+        type=str,
+        default="./data",
+        help="Directory where datasets will be stored (default: ./data)",
+    )
+
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--mini",
+        action="store_true",
+        help="Download official MiniLibriMix (~580 MB download, ~750 MB disk).",
+    )
+    mode_group.add_argument(
+        "--clean_only",
+        action="store_true",
+        help="Generate clean Libri2Mix mixtures only (mix_clean). Fits in ~12 GB.",
+    )
+    mode_group.add_argument(
+        "--with_noise",
+        action="store_true",
+        help="Generate clean + noisy Libri2Mix mixtures (mix_clean & mix_both). Requires ~30 GB.",
+    )
+
+    args = parser.parse_args()
+
+    storage_path = Path(args.storage_dir).resolve()
+    storage_path.mkdir(parents=True, exist_ok=True)
+
+    # Determine choice: CLI flag or interactive menu
+    if args.mini:
+        choice = "mini"
+    elif args.clean_only:
+        choice = "clean"
+    elif args.with_noise:
+        choice = "both"
+    else:
+        choice = prompt_dataset_choice(storage_path)
+
+    # Execute selected setup
     py = "python" if sys.platform == "win32" else "python3"
-    mixture_flag = "--mixture_type mix_both" if has_wham else "--mixture_type mix_clean"
-    print(f"\n  Start training with:")
-    print(f"    {py} train.py --data_dir {librimix_outdir} --dataset_type librimix {mixture_flag}")
-    if not has_wham:
-        print()
-        print("  Note: only mix_clean was generated. To add noisy mixtures later, re-run:")
-        print(f"    python scripts/setup_data.py --storage_dir {args.storage_dir} --with_noise")
+
+    if choice == "mini":
+        out_dir = setup_minilibrimix(storage_path)
+        print_banner("MiniLibriMix Ready!")
+        print(f"  Location: {out_dir}")
+        print("\n  Train with:")
+        print(f"    {py} train.py --dataset_type mini_librimix --data_dir {out_dir} --mixture_type mix_clean")
+        print("\n  Evaluate with:")
+        print(f"    {py} test_model.py --dataset_type mini_librimix --data_dir {out_dir}")
+    else:
+        want_noise = (choice == "both")
+        out_dir, mix_type = setup_libri2mix(storage_path, want_noise=want_noise)
+        print("\n  Train with:")
+        print(f"    {py} train.py --dataset_type librimix --data_dir {out_dir} --mixture_type {mix_type}")
+        print("\n  Evaluate with:")
+        print(f"    {py} test_model.py --dataset_type librimix --data_dir {out_dir} --mixture_type {mix_type}")
+
     print("=" * 68 + "\n")
 
 
 if __name__ == "__main__":
     main()
+

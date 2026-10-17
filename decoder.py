@@ -1,109 +1,13 @@
 """
-ConvTasNet 1-D Learned Decoder.
+STFT Spectrogram Synthesis Decoder (iSTFT) for Speech Separation.
 
-Transforms the separated latent feature representation back into the time domain
-using a 1-D Transposed Convolution (synthesizer filterbank).
+Transforms separated latent feature representations back into the time domain
+using Inverse Short-Time Fourier Transform (iSTFT) with mixture phase.
 """
 
 import torch
 import torch.nn as nn
 from typing import Optional
-
-
-class ConvTasNetDecoder(nn.Module):
-    """
-    Learned 1-D Transposed Convolutional Decoder for Conv-TasNet.
-
-    Acts as an inverse filterbank that synthesizes separated time-domain audio
-    from the masked latent representations.
-
-    Args:
-        in_channels (int): N, number of latent channels from encoder. Default: 64.
-        out_channels (int): Audio channels per speaker (1 for mono). Default: 1.
-        kernel_size (int): L, length of each synthesis filter (matches encoder kernel). Default: 16.
-        stride (int): Hop size (matches encoder stride). Default: 8.
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 64,
-        out_channels: int = 1,
-        kernel_size: int = 16,
-        stride: int = 8,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-
-        # 1-D Transposed Convolution (overlap-add synthesis filterbank)
-        self.conv_transpose1d = nn.ConvTranspose1d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            bias=False,
-        )
-
-        # Initialize weights
-        nn.init.kaiming_normal_(self.conv_transpose1d.weight, mode="fan_in")
-
-    def forward(
-        self,
-        w_masked: torch.Tensor,
-        target_length: Optional[int] = None,
-        verbose: bool = False,
-    ) -> torch.Tensor:
-        """
-        Forward pass for 1-D Decoder.
-
-        Args:
-            w_masked (torch.Tensor): Masked latent features.
-                Can be:
-                - Single speaker: [Batch, N, Latent_Length]
-                - Multiple speakers: [Batch, Num_Sources, N, Latent_Length]
-            target_length (int, optional): Original waveform length T for exact length matching.
-            verbose (bool): If True, print tensor shapes.
-
-        Returns:
-            torch.Tensor: Reconstructed time-domain waveform(s).
-                - For single speaker input: [Batch, 1, Time]
-                - For multi-speaker input:  [Batch, Num_Sources, Time]
-        """
-        is_multi_source = (w_masked.dim() == 4)
-
-        if is_multi_source:
-            # Shape: [B, K, N, L] -> flatten batch and speaker dimensions: [B*K, N, L]
-            b, k, n, l = w_masked.shape
-            w_flat = w_masked.reshape(b * k, n, l)
-            audio_flat = self.conv_transpose1d(w_flat)  # [B*K, 1, T_recon]
-            
-            # Trim or pad to exact target length if specified
-            if target_length is not None:
-                if audio_flat.shape[-1] > target_length:
-                    audio_flat = audio_flat[..., :target_length]
-                elif audio_flat.shape[-1] < target_length:
-                    pad_len = target_length - audio_flat.shape[-1]
-                    audio_flat = nn.functional.pad(audio_flat, (0, pad_len))
-            
-            # Reshape back to [B, K, T]
-            time_dim = audio_flat.shape[-1]
-            audio = audio_flat.reshape(b, k, time_dim)
-        else:
-            # Shape: [B, N, L]
-            audio = self.conv_transpose1d(w_masked)  # [B, 1, T_recon]
-            if target_length is not None:
-                if audio.shape[-1] > target_length:
-                    audio = audio[..., :target_length]
-                elif audio.shape[-1] < target_length:
-                    pad_len = target_length - audio.shape[-1]
-                    audio = nn.functional.pad(audio, (0, pad_len))
-
-        if verbose:
-            print(f"[Decoder] Latent input: {w_masked.shape} -> Synthesized waveform: {audio.shape}")
-
-        return audio
 
 
 class SpectrogramDecoder(nn.Module):
@@ -261,4 +165,9 @@ class SpectrogramDecoder(nn.Module):
             print(f"[SpectrogramDecoder] Latent input: {w_masked.shape} -> Synthesized waveform: {audio.shape}")
 
         return audio
+
+
+# Canonical alias for SpectrogramDecoder
+STFTDecoder = SpectrogramDecoder
+
 

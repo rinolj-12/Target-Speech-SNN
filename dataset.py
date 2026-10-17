@@ -15,12 +15,13 @@ import numpy as np
 import soundfile as sf
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Union
+from speaker_encoder import get_speaker_cache_manager
 
 
 class MiniLibriMixDataset(Dataset):
     """
-    Dataset loader for Libri2Mix / MiniLibriMix real speech separation dataset.
+    Dataset loader for Libri2Mix / MiniLibriMix real speech separation and target extraction.
 
     Expects standard LibriMix structure:
         data_dir/
@@ -39,14 +40,25 @@ class MiniLibriMixDataset(Dataset):
         mixture_type: str = "mix_both",  # 'mix_both' (noisy) or 'mix_clean'
         cache_in_memory: bool = False,
         epoch_samples: Optional[int] = None,
+        task_mode: str = "tse",          # 'tse' (Target Speech Extraction)
+        spk_cache_path: str = "./data/minilibrimix_spk_embeddings.pt",
     ):
         super().__init__()
         self.data_dir = data_dir
         self.sample_rate = sample_rate
+        self.task_mode = task_mode.lower()
+        self.spk_cache_path = spk_cache_path
+        self.cache_manager = get_speaker_cache_manager(cache_file=spk_cache_path)
         self.segment_samples = int(sample_rate * segment_length)
         self.pairs = []
-
-        target_subsets = ["val", "dev", "test"] if subset in ["val", "dev", "test"] else ["train"]
+        if subset == "test":
+            target_subsets = ["test"]
+        elif subset in ["val", "dev"]:
+            target_subsets = ["val", "dev"]
+        elif subset in ["train", "train-100", "train-360"]:
+            target_subsets = ["train"]
+        else:
+            target_subsets = [subset]
 
         if os.path.isdir(data_dir):
             for root, _, _ in os.walk(data_dir):
@@ -77,8 +89,8 @@ class MiniLibriMixDataset(Dataset):
                         if len(self.pairs) > 0 and subset != "all":
                             break
 
-            # Fallback if no specific subset folder found
-            if len(self.pairs) == 0:
+            # Fallback only when loading all data without subset structure
+            if len(self.pairs) == 0 and subset == "all":
                 for root, _, _ in os.walk(data_dir):
                     cand_s1 = os.path.join(root, "s1")
                     cand_s2 = os.path.join(root, "s2")
@@ -172,9 +184,37 @@ class MiniLibriMixDataset(Dataset):
         mix, s1, s2 = mix / max_val, s1 / max_val, s2 / max_val
 
         mix_tensor = torch.from_numpy(mix.copy()).unsqueeze(0).float()  # [1, Time]
-        targets_tensor = torch.from_numpy(np.stack([s1.copy(), s2.copy()], axis=0)).float()  # [2, Time]
 
-        return mix_tensor, targets_tensor
+        # Extract speaker IDs from filenames (LibriMix format: 'spk1_spk2.wav')
+        f1 = os.path.basename(p_s1).replace(".wav", "").replace(".flac", "")
+        parts1 = f1.split("_")
+        spk1_id = parts1[0].split("-")[0]
+        spk2_id = parts1[1].split("-")[0] if len(parts1) > 1 else os.path.basename(p_s2).split("-")[0]
+
+        # In training: randomly select target (50% s1, 50% s2). In eval: deterministic
+        if self.subset == "train":
+            choose_spk1 = (np.random.rand() > 0.5)
+        else:
+            choose_spk1 = (item_idx % 2 == 0)
+
+        if choose_spk1:
+            target_clean = s1
+            target_spk_id = spk1_id
+            ref_path = p_s1
+        else:
+            target_clean = s2
+            target_spk_id = spk2_id
+            ref_path = p_s2
+
+        # Fetch memoized 192-D speaker voiceprint
+        spk_embed = self.cache_manager.get_embedding(
+            speaker_id=target_spk_id,
+            reference_audio_path=ref_path,
+            sample_rate=self.sample_rate,
+        )
+
+        target_tensor = torch.from_numpy(target_clean.copy()).unsqueeze(0).float()  # [1, Time]
+        return mix_tensor, target_tensor, spk_embed
 
 
 class WavFolderDataset(Dataset):
@@ -417,10 +457,13 @@ def get_dataloaders(
     num_workers: int = 2,
     pin_memory: Optional[bool] = None,
     train_samples_per_epoch: Optional[int] = None,
-    mixture_type: str = "mix_both",
+    mixture_type: str = "mix_clean",
+    eval_subset: str = "val",
+    task_mode: str = "tse",
+    spk_cache_path: str = "./data/minilibrimix_spk_embeddings.pt",
 ) -> Tuple[DataLoader, DataLoader]:
     """
-    Factory creating training and validation DataLoaders for Libri2Mix, MiniLibriMix, or custom WAV folders.
+    Factory creating training and validation/test DataLoaders for Libri2Mix, MiniLibriMix, or custom WAV folders.
     """
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
@@ -455,23 +498,53 @@ def get_dataloaders(
             subset="train",
             mixture_type=mixture_type,
             epoch_samples=effective_epoch_samples,
+            task_mode=task_mode,
+            spk_cache_path=spk_cache_path,
         )
         val_dataset = Libri2MixDataset(
             folder,
             sample_rate=sample_rate,
             segment_length=segment_length,
-            subset="val",
+            subset=eval_subset,
             mixture_type=mixture_type,
+            task_mode=task_mode,
+            spk_cache_path=spk_cache_path,
         )
-        if len(val_dataset) == 0:
-            val_dataset = Libri2MixDataset(
+        # If test split was requested but absent (e.g. MiniLibriMix has train/val), fall back to val/dev
+        if len(val_dataset) == 0 and eval_subset == "test":
+            for alt in ["val", "dev"]:
+                alt_ds = Libri2MixDataset(
+                    folder,
+                    sample_rate=sample_rate,
+                    segment_length=segment_length,
+                    subset=alt,
+                    mixture_type=mixture_type,
+                    task_mode=task_mode,
+                    spk_cache_path=spk_cache_path,
+                )
+                if len(alt_ds) > 0:
+                    val_dataset = alt_ds
+                    print(
+                        f"[Dataset] No dedicated 'test' folder in '{folder}'. "
+                        f"Auto-evaluating on held-out '{alt}' split ({len(val_dataset)} samples)."
+                    )
+                    break
+        elif len(val_dataset) == 0 and eval_subset in ["val", "dev"]:
+            alt = "dev" if eval_subset == "val" else "val"
+            alt_ds = Libri2MixDataset(
                 folder,
                 sample_rate=sample_rate,
                 segment_length=segment_length,
-                subset="dev",
+                subset=alt,
                 mixture_type=mixture_type,
+                task_mode=task_mode,
+                spk_cache_path=spk_cache_path,
             )
+            if len(alt_ds) > 0:
+                val_dataset = alt_ds
+
         if len(val_dataset) == 0:
+            print(f"[Dataset Warning] No validation/test split found. Falling back to training samples.")
             val_dataset = train_dataset
 
         if len(train_dataset) == 0:
@@ -538,12 +611,13 @@ if __name__ == "__main__":
     print(f"[OK] Val samples:   {len(val_loader.dataset)} ({len(val_loader)} batches of {batch_size})")
     
     # Fetch a sample batch
-    mix_batch, target_batch = next(iter(train_loader))
+    mix_batch, target_batch, spk_embed = next(iter(train_loader))
     print("\n--- Sample Batch Verification ---")
-    print(f"Mixture tensor shape:  {mix_batch.shape} (Expected: [{batch_size}, 1, {int(sample_rate * segment_sec)}])")
-    print(f"Target tensor shape:   {target_batch.shape} (Expected: [{batch_size}, 2, {int(sample_rate * segment_sec)}])")
-    print(f"Mixture value range:   [{mix_batch.min().item():.3f}, {mix_batch.max().item():.3f}]")
-    print(f"Target value range:    [{target_batch.min().item():.3f}, {target_batch.max().item():.3f}]")
+    print(f"Mixture tensor shape:      {mix_batch.shape} (Expected: [{batch_size}, 1, {int(sample_rate * segment_sec)}])")
+    print(f"Target tensor shape:       {target_batch.shape} (Expected: [{batch_size}, 1, {int(sample_rate * segment_sec)}])")
+    print(f"Speaker embedding shape:   {spk_embed.shape} (Expected: [{batch_size}, 192])")
+    print(f"Mixture value range:       [{mix_batch.min().item():.3f}, {mix_batch.max().item():.3f}]")
+    print(f"Target value range:        [{target_batch.min().item():.3f}, {target_batch.max().item():.3f}]")
     
-    print("\n[OK] MiniLibriMix Dataset verification completed successfully!")
+    print("\n[OK] MiniLibriMix Target Speech Extraction Dataset verification completed successfully!")
 

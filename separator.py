@@ -61,6 +61,7 @@ class SpikingTCNSeparator(nn.Module):
         use_residual_bridge: bool = True,
         surrogate: str = "fast_sigmoid",
         use_checkpointing: bool = True,
+        spk_embed_dim: Optional[int] = None,
     ):
         super().__init__()
         if dilations is None:
@@ -76,6 +77,15 @@ class SpikingTCNSeparator(nn.Module):
         self.snn_readout = snn_readout.lower()
         self.use_residual_bridge = use_residual_bridge
         self.use_checkpointing = use_checkpointing
+        self.spk_embed_dim = spk_embed_dim
+
+        # Neuromodulatory FiLM Conditioning Projection for Target Speech Extraction
+        if spk_embed_dim is not None and spk_embed_dim > 0:
+            self.film_proj = nn.Linear(spk_embed_dim, 2 * bottleneck_channels)
+            nn.init.zeros_(self.film_proj.bias)
+            nn.init.normal_(self.film_proj.weight, std=0.02)
+        else:
+            self.film_proj = None
 
         # Bottleneck 1x1 conv: [N -> B_conv]
         self.bottleneck_conv = nn.Conv1d(in_channels, bottleneck_channels, kernel_size=1, bias=False)
@@ -132,6 +142,7 @@ class SpikingTCNSeparator(nn.Module):
         self,
         spike_seq: torch.Tensor,
         continuous_w: Optional[torch.Tensor] = None,
+        spk_embed: Optional[torch.Tensor] = None,
         verbose: bool = False,
     ) -> torch.Tensor:
         """
@@ -140,6 +151,7 @@ class SpikingTCNSeparator(nn.Module):
         Args:
             spike_seq: Spike / current sequence of shape [Timesteps S, Batch, N, Latent_Length].
             continuous_w: Optional continuous latent features [Batch, N, Latent_Length] for residual bridge.
+            spk_embed: Optional target speaker voiceprint vector [Batch, D_spk] for FiLM conditioning.
             verbose: If True, print tensor shapes.
 
         Returns:
@@ -151,6 +163,17 @@ class SpikingTCNSeparator(nn.Module):
         flat_spikes = spike_seq.reshape(s_steps * batch, n_chan, l_len)
         flat_bottleneck = self.bottleneck_norm(self.bottleneck_conv(flat_spikes))
         x_seq = flat_bottleneck.reshape(s_steps, batch, self.bottleneck_channels, l_len)
+
+        # Neuromodulatory FiLM Conditioning: Scale and shift SNN bottleneck based on target voiceprint
+        gamma, beta = None, None
+        if self.film_proj is not None and spk_embed is not None:
+            film_params = self.film_proj(spk_embed)  # [B, 2 * B_conv]
+            gamma, beta = film_params.chunk(2, dim=-1)  # [B, B_conv] each
+            # Centered at 1.0 with sigmoid gating
+            gamma = (torch.sigmoid(gamma) * 2.0).unsqueeze(-1)  # [B, B_conv, 1]
+            beta = beta.unsqueeze(-1)                           # [B, B_conv, 1]
+            # Broadcast across simulation timesteps S: [S, B, B_conv, L]
+            x_seq = x_seq * gamma.unsqueeze(0) + beta.unsqueeze(0)
 
         # Step 2: Pass through stacked spiking dilated conv blocks
         skip_total = torch.zeros_like(x_seq)
@@ -187,6 +210,8 @@ class SpikingTCNSeparator(nn.Module):
         # Step 4: Inject Continuous Residual Bridge if configured and continuous_w is supplied
         if self.bridge_conv is not None and continuous_w is not None:
             bridge_feats = self.bridge_norm(self.bridge_conv(continuous_w))
+            if gamma is not None and beta is not None:
+                bridge_feats = bridge_feats * gamma + beta
             readout = readout + bridge_feats
 
         # Step 5: Generate masks: [B, B_conv, L] -> [B, K * N, L]

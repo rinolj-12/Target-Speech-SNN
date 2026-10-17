@@ -1,55 +1,39 @@
 """
-Model Testing and Evaluation Suite for Spiking Conv-TasNet Speech Separation.
+Model Testing, Multi-Speaker Evaluation, and Inference Suite for Spiking Target Speech Extraction.
 
 Performs:
-1. Evaluation on MiniLibriMix validation dataset.
-2. Metrics computation: Input SI-SDR, Output SI-SDR, SI-SNRi (Improvement), Latency.
-3. Audio generation: Saves separated audio WAV files organized in encoder-specific subfolders.
-4. Visualizations: Saves separate individual PNG plots for waveforms, spectrograms, masks, and SNN activity.
+1. Benchmark evaluation on MiniLibriMix validation/test dataset.
+2. Metrics computation: Input SI-SDR, Output SI-SDR, SI-SNRi (Improvement), and Latency.
+3. Multi-Speaker Testing: Dynamically mixes 3 or 4 speakers and extracts strictly the selected target voice.
+4. Custom audio evaluation: Supports passing custom mixed audio or individual speaker WAVs with target reference.
+5. Generates separated WAV audio and categorized diagnostic PNG visualizations.
 """
 
 import os
 import argparse
 import time
+from typing import Tuple, Optional, List
 import numpy as np
 import soundfile as sf
 import torch
 import torch.nn as nn
-from typing import Tuple, List, Optional, Dict
 
 from config import ModelConfig, TrainConfig
-from model import SpikingConvTasNet, build_model
-from losses import calculate_sisdr, NegSISDRLoss, PITLossWrapper
+from model import SpikingConvTasNet
+from losses import TargetSISDRLoss, calculate_sisdr
 from dataset import get_dataloaders
+from speaker_encoder import SpeakerEncoder, get_speaker_cache_manager
 from visualize import (
-    plot_waveform_comparison,
-    plot_spectrograms,
-    plot_snn_raster,
-    plot_mask_analysis,
-    plot_multi_encoder_comparison,
     save_separate_waveforms,
     save_separate_spectrograms,
     save_separate_mask_plots,
     save_separate_snn_raster_plots,
-    save_separate_comparison_plots,
 )
 
 
-def get_encoder_folder_info(encoder_type: str, base_output_dir: str = "./test_outputs") -> Tuple[str, str]:
-    """
-    Resolves the canonical subfolder name and path for a given encoder architecture.
-    Subfolders:
-      - 'standard_encoder' (Standard 1-D Conv + Spike)
-      - 'spectrogram' (STFT Spectrogram + iSTFT)
-    """
-    enc = str(encoder_type).strip().lower()
-    if "stand" in enc:
-        folder_name = "standard_encoder"
-    elif "spect" in enc or "stft" in enc:
-        folder_name = "spectrogram"
-    else:
-        folder_name = enc
-
+def get_encoder_folder_info(encoder_type: str = "spectrogram", base_output_dir: str = "./test_outputs") -> Tuple[str, str]:
+    """Resolves the canonical subfolder name and path for evaluation outputs."""
+    folder_name = "spectrogram"
     target_dir = os.path.join(base_output_dir, folder_name)
     os.makedirs(target_dir, exist_ok=True)
     return folder_name, target_dir
@@ -61,7 +45,6 @@ def load_model(checkpoint_path: str, device: torch.device = torch.device("cpu"))
         raise FileNotFoundError(f"Checkpoint not found at '{checkpoint_path}'.")
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
     config = checkpoint.get("model_config", ModelConfig())
     model = SpikingConvTasNet(config)
 
@@ -73,7 +56,6 @@ def load_model(checkpoint_path: str, device: torch.device = torch.device("cpu"))
 
     model.to(device)
     model.eval()
-
     return model, config, checkpoint
 
 
@@ -96,20 +78,26 @@ def evaluate_model(
     model: nn.Module,
     val_loader: torch.utils.data.DataLoader,
     device: torch.device,
+    task_mode: str = "tse",
     max_batches: Optional[int] = None,
 ) -> dict:
-    """Evaluates model over validation data loader and computes SI-SDR, SI-SNRi, and accurate CUDA/CPU latency."""
-    criterion = PITLossWrapper(loss_fn=NegSISDRLoss(), num_sources=2)
+    """Evaluates model over validation data loader and computes SI-SDR, SI-SNRi, and accurate latency."""
     model.eval()
-
     total_output_sisdr = []
     total_input_sisdr = []
     latencies = []
 
     with torch.no_grad():
-        for i, (mix_batch, target_batch) in enumerate(val_loader):
+        for i, batch in enumerate(val_loader):
             if max_batches is not None and i >= max_batches:
                 break
+
+            if len(batch) == 3:
+                mix_batch, target_batch, spk_embed = batch
+                spk_embed = spk_embed.to(device, non_blocking=True)
+            else:
+                mix_batch, target_batch = batch
+                spk_embed = None
 
             mix_batch = mix_batch.to(device, non_blocking=True)
             target_batch = target_batch.to(device, non_blocking=True)
@@ -118,16 +106,19 @@ def evaluate_model(
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
 
-            est_sources = model(mix_batch)
+            if spk_embed is not None:
+                est_sources = model(mix_batch, spk_embed=spk_embed)
+            else:
+                est_sources = model(mix_batch)
 
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t1 = time.perf_counter()
             latencies.append((t1 - t0) * 1000.0 / mix_batch.size(0))
 
-            # Metric calculation
-            loss, best_est, out_sisdr = criterion(est_sources, target_batch)
-            _, _, in_sisdr = criterion(mix_batch.repeat(1, 2, 1), target_batch)
+            # Target Speech Extraction metric calculation
+            out_sisdr = calculate_sisdr(est_sources.squeeze(1), target_batch.squeeze(1))
+            in_sisdr = calculate_sisdr(mix_batch.squeeze(1), target_batch.squeeze(1))
 
             out_val = out_sisdr.cpu().tolist()
             if isinstance(out_val, list):
@@ -165,332 +156,225 @@ def run_sample_separation(
     device: torch.device,
     output_dir: str = "./test_outputs",
 ):
-    """Runs separation on representative test samples and saves audio + separate plots in encoder subfolder."""
-    enc_type = getattr(config, "encoder_type", "standard")
-    folder_name, enc_output_dir = get_encoder_folder_info(enc_type, output_dir)
+    """
+    Runs dual target extraction on a representative mixture:
+    Extracts Speaker 1 using Vector 1, and Speaker 2 using Vector 2 from the exact same mixture.
+    """
+    enc_type = getattr(config, "encoder_type", "spectrogram")
+    _, enc_output_dir = get_encoder_folder_info(enc_type, output_dir)
     os.makedirs(enc_output_dir, exist_ok=True)
 
-    criterion = PITLossWrapper(loss_fn=NegSISDRLoss(), num_sources=2)
+    batch = next(iter(val_loader))
+    dataset = val_loader.dataset
 
-    mix_batch, target_batch = next(iter(val_loader))
-    mix_batch = mix_batch.to(device, non_blocking=True)
-    target_batch = target_batch.to(device, non_blocking=True)
+    # Get file paths for sample 0
+    p_mix, p_s1, p_s2 = dataset.pairs[0]
+    s1_full, _ = sf.read(p_s1)
+    s2_full, _ = sf.read(p_s2)
+    mix_full, sr = sf.read(p_mix) if p_mix and os.path.exists(p_mix) else (s1_full[:len(s2_full)] + s2_full[:len(s1_full)], config.sample_rate)
+
+    common_len = min(len(s1_full), len(s2_full), len(mix_full), int(config.segment_length * config.sample_rate))
+    s1_clip = s1_full[:common_len]
+    s2_clip = s2_full[:common_len]
+    mix_clip = mix_full[:common_len]
+
+    max_v = max(np.max(np.abs(mix_clip)), 1e-7)
+    mix_norm = mix_clip / max_v
+    s1_norm = s1_clip / max_v
+    s2_norm = s2_clip / max_v
+
+    x = torch.from_numpy(mix_norm).unsqueeze(0).unsqueeze(0).float().to(device)
+
+    # Extract embeddings for Speaker 1 and Speaker 2
+    f1 = os.path.basename(p_s1).replace(".wav", "").replace(".flac", "")
+    parts1 = f1.split("_")
+    spk1_id = parts1[0].split("-")[0]
+    spk2_id = parts1[1].split("-")[0] if len(parts1) > 1 else os.path.basename(p_s2).split("-")[0]
+
+    cache_mgr = getattr(dataset, "cache_manager", None)
+    if cache_mgr is None:
+        cache_mgr = get_speaker_cache_manager(device=str(device))
+
+    emb1 = cache_mgr.get_embedding(spk1_id, reference_audio_path=p_s1).unsqueeze(0).to(device)
+    emb2 = cache_mgr.get_embedding(spk2_id, reference_audio_path=p_s2).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        x = mix_batch[0:1]  # single sample [1, 1, Time]
-        targets = target_batch[0]  # [2, Time]
+        # Pass 1: Extract Speaker 1 using Vector 1
+        est1 = model(x, spk_embed=emb1)[0, 0].cpu().numpy()
+        # Pass 2: Extract Speaker 2 using Vector 2 from the EXACT same mixture!
+        est2 = model(x, spk_embed=emb2)[0, 0].cpu().numpy()
 
-        # Model forward and intermediate extraction based on encoder_type
-        if model.encoder_type in ["spectrogram", "stft"]:
-            w, phase = model.encoder(x)
-        else:
-            w = model.encoder(x)
-            phase = None
+    # Metrics
+    in_sdr1 = calculate_sisdr(torch.from_numpy(mix_norm), torch.from_numpy(s1_norm)).item()
+    out_sdr1 = calculate_sisdr(torch.from_numpy(est1), torch.from_numpy(s1_norm)).item()
+    in_sdr2 = calculate_sisdr(torch.from_numpy(mix_norm), torch.from_numpy(s2_norm)).item()
+    out_sdr2 = calculate_sisdr(torch.from_numpy(est2), torch.from_numpy(s2_norm)).item()
 
-        if isinstance(model, SpikingConvTasNet):
-            spike_seq = model.spike_encoder(w)
-            masks = model.separator(spike_seq)
-        else:
-            spike_seq = None
-            masks = model.separator(w)
-
-        w_masked = masks * w.unsqueeze(1)
-        if model.encoder_type in ["spectrogram", "stft"]:
-            separated = model.decoder(w_masked, phase=phase, target_length=x.shape[-1])
-        else:
-            separated = model.decoder(w_masked, target_length=x.shape[-1])
-
-        # Find best permutation alignment with ground truth
-        _, best_separated, sample_sisdr = criterion(separated, targets.unsqueeze(0))
-        best_separated = best_separated[0]  # [2, Time]
-
-    # Convert tensors to numpy arrays
-    mix_np = x[0, 0].cpu().numpy()
-    targets_np = targets.cpu().numpy()
-    est_np = best_separated.cpu().numpy()
-    masks_np = masks[0].cpu()
-
-    sr = config.sample_rate
-
-    # Define categorized subdirectories inside encoder folder
     audio_dir = os.path.join(enc_output_dir, "audio")
-    waveform_dir = os.path.join(enc_output_dir, "waveforms")
-    spec_dir = os.path.join(enc_output_dir, "spectrograms")
-    mask_dir = os.path.join(enc_output_dir, "masks")
-    snn_dir = os.path.join(enc_output_dir, "snn")
-
     os.makedirs(audio_dir, exist_ok=True)
-    os.makedirs(waveform_dir, exist_ok=True)
-    os.makedirs(spec_dir, exist_ok=True)
-    os.makedirs(mask_dir, exist_ok=True)
-    os.makedirs(snn_dir, exist_ok=True)
 
-    # Save audio files inside audio/ subfolder
-    audio_mix_path = os.path.join(audio_dir, "mixture.wav")
-    audio_tgt1_path = os.path.join(audio_dir, "target_speaker1.wav")
-    audio_tgt2_path = os.path.join(audio_dir, "target_speaker2.wav")
-    audio_sep1_path = os.path.join(audio_dir, "separated_speaker1.wav")
-    audio_sep2_path = os.path.join(audio_dir, "separated_speaker2.wav")
+    sf.write(os.path.join(audio_dir, "mixture.wav"), mix_norm, sr)
+    sf.write(os.path.join(audio_dir, "target_speaker1_clean.wav"), s1_norm, sr)
+    sf.write(os.path.join(audio_dir, "target_speaker2_clean.wav"), s2_norm, sr)
+    sf.write(os.path.join(audio_dir, "extracted_speaker1.wav"), est1, sr)
+    sf.write(os.path.join(audio_dir, "extracted_speaker2.wav"), est2, sr)
 
-    sf.write(audio_mix_path, mix_np, sr)
-    sf.write(audio_tgt1_path, targets_np[0], sr)
-    sf.write(audio_tgt2_path, targets_np[1], sr)
-    sf.write(audio_sep1_path, est_np[0], sr)
-    sf.write(audio_sep2_path, est_np[1], sr)
+    print(f"\n[Target Extraction Audio Outputs Saved in '{audio_dir}']")
+    print(f"  - Input Mixture:               {os.path.join(audio_dir, 'mixture.wav')}")
+    print(f"  - Extracted Spk 1 (via Vec 1): {os.path.join(audio_dir, 'extracted_speaker1.wav')} (SI-SDRi: {out_sdr1 - in_sdr1:+.2f} dB)")
+    print(f"  - Extracted Spk 2 (via Vec 2): {os.path.join(audio_dir, 'extracted_speaker2.wav')} (SI-SDRi: {out_sdr2 - in_sdr2:+.2f} dB)")
 
-    print(f"\n[Audio Wave Outputs Saved in '{audio_dir}']")
-    print(f"  - Mixture:              {audio_mix_path}")
-    print(f"  - Ground Truth Spk 1:   {audio_tgt1_path}")
-    print(f"  - Ground Truth Spk 2:   {audio_tgt2_path}")
-    print(f"  - Separated Spk 1:      {audio_sep1_path}")
-    print(f"  - Separated Spk 2:      {audio_sep2_path}")
+    # Visualizations
+    targets_2d = np.stack([s1_norm, s2_norm], axis=0)
+    estimates_2d = np.stack([est1, est2], axis=0)
+    save_separate_waveforms(mix_norm, targets_2d, estimates_2d, sr, enc_output_dir)
+    save_separate_spectrograms(mix_norm, targets_2d, estimates_2d, sr, enc_output_dir)
 
-    # Generate and save separate visual analysis plots in respective subfolders
-    print(f"\n[Generating Categorized PNG Visualizations in '{enc_output_dir}']")
-    wav_paths = save_separate_waveforms(
-        mix_np, targets_np, est_np, sample_rate=sr,
-        output_dir=waveform_dir,
-        title_suffix=f"(SI-SDR = {sample_sisdr.item():.2f} dB)"
-    )
-    for p in wav_paths.values():
-        print(f"  - Waveform PNG:         {p}")
 
-    spec_paths = save_separate_spectrograms(
-        mix_np, targets_np, est_np, sample_rate=sr,
-        output_dir=spec_dir,
-    )
-    for p in spec_paths.values():
-        print(f"  - Spectrogram PNG:      {p}")
+def run_multitalker_test(
+    model: nn.Module,
+    config: ModelConfig,
+    device: torch.device,
+    data_dir: str = "./data/MiniLibriMix",
+    num_talkers: int = 3,
+    target_idx: int = 0,
+    output_dir: str = "./test_outputs",
+):
+    """
+    Multi-Talker Cocktail Party Test:
+    Mixes 3 or 4 overlapping speakers, then extracts strictly the selected target voice.
+    """
+    print(f"\n" + "=" * 68)
+    print(f"      MULTI-TALKER TEST ({num_talkers} SPEAKERS OVERLAPPING)")
+    print("=" * 68)
+    print(f"Generating synthetic cocktail party mixture with {num_talkers} voices...")
 
-    mask_paths = save_separate_mask_plots(
-        masks_np,
-        output_dir=mask_dir,
-        title_suffix=f"({model.encoder_type.capitalize()} Masks)"
-    )
-    for p in mask_paths.values():
-        print(f"  - Mask PNG:             {p}")
+    # Collect clean audio files from unique speakers
+    s1_files = []
+    for root, _, files in os.walk(data_dir):
+        if os.path.basename(root) in ["s1", "s2"]:
+            for f in sorted(files):
+                if f.endswith((".wav", ".flac")):
+                    s1_files.append(os.path.join(root, f))
+                    if len(s1_files) >= num_talkers * 3:
+                        break
+            if len(s1_files) >= num_talkers * 3:
+                break
 
-    if spike_seq is not None:
-        raster_paths = save_separate_snn_raster_plots(spike_seq, output_dir=snn_dir)
-        for p in raster_paths.values():
-            print(f"  - SNN Spike PNG:        {p}")
+    if len(s1_files) < num_talkers:
+        print(f"[Warning] Not enough audio files found in '{data_dir}' to form a {num_talkers}-speaker mixture.")
+        return
 
-    print(f"[Done] All audio waves and separate PNGs organized into subfolders in '{enc_output_dir}'")
+    # Select distinct files
+    stride = len(s1_files) // num_talkers
+    chosen_files = [s1_files[i * stride] for i in range(num_talkers)]
+    sr = config.sample_rate
+    target_samples = int(config.segment_length * sr)
+
+    clips = []
+    speaker_ids = []
+    for f in chosen_files:
+        wav, in_sr = sf.read(f)
+        if wav.ndim > 1:
+            wav = wav.mean(axis=-1)
+        if len(wav) < target_samples:
+            wav = np.pad(wav, (0, target_samples - len(wav)))
+        else:
+            wav = wav[:target_samples]
+        # Normalize
+        wav = wav / max(np.max(np.abs(wav)), 1e-7)
+        clips.append(wav)
+
+        spk_id = os.path.basename(f).split("_")[0].split("-")[0]
+        speaker_ids.append(spk_id)
+
+    # Form crowded mixture
+    crowded_mixture = np.sum(clips, axis=0)
+    crowded_mixture = crowded_mixture / max(np.max(np.abs(crowded_mixture)), 1e-7)
+
+    target_idx = max(0, min(target_idx, num_talkers - 1))
+    target_clean = clips[target_idx]
+    target_spk_id = speaker_ids[target_idx]
+    target_ref_path = chosen_files[target_idx]
+
+    # Extract target embedding
+    cache_mgr = get_speaker_cache_manager(device=str(device))
+    target_emb = cache_mgr.get_embedding(target_spk_id, reference_audio_path=target_ref_path).unsqueeze(0).to(device)
+
+    # Run SNN Extraction
+    x_tensor = torch.from_numpy(crowded_mixture).unsqueeze(0).unsqueeze(0).float().to(device)
+    with torch.no_grad():
+        extracted_target = model(x_tensor, spk_embed=target_emb)[0, 0].cpu().numpy()
+
+    # Calculate metrics
+    in_sdr = calculate_sisdr(torch.from_numpy(crowded_mixture), torch.from_numpy(target_clean)).item()
+    out_sdr = calculate_sisdr(torch.from_numpy(extracted_target), torch.from_numpy(target_clean)).item()
+    sisdr_gain = out_sdr - in_sdr
+
+    multi_dir = os.path.join(output_dir, "multitalker")
+    os.makedirs(multi_dir, exist_ok=True)
+
+    mix_path = os.path.join(multi_dir, f"crowded_mixture_{num_talkers}speakers.wav")
+    clean_path = os.path.join(multi_dir, f"target_speaker_{target_idx+1}_clean.wav")
+    extracted_path = os.path.join(multi_dir, f"target_speaker_{target_idx+1}_extracted.wav")
+
+    sf.write(mix_path, crowded_mixture, sr)
+    sf.write(clean_path, target_clean, sr)
+    sf.write(extracted_path, extracted_target, sr)
+
+    print(f"- Selected Target Speaker:  Speaker #{target_idx+1} (ID: {target_spk_id})")
+    print(f"- Interfering Talkers:      {num_talkers - 1} overlapping voices")
+    print(f"- Input Mixture SI-SDR:     {in_sdr:6.2f} dB")
+    print(f"- Extracted Target SI-SDR:  {out_sdr:6.2f} dB")
+    print(f"- SI-SDR Improvement (Δ):   {sisdr_gain:+6.2f} dB")
+    print(f"\n[Saved Multi-Talker Audio Clips in '{multi_dir}']")
+    print(f"  - Crowded Mixture:        {mix_path}")
+    print(f"  - Ground Truth Target:    {clean_path}")
+    print(f"  - Extracted Target Audio: {extracted_path}")
+    print("=" * 68)
 
 
 def main():
     default_model_cfg = ModelConfig()
     default_train_cfg = TrainConfig()
 
-    parser = argparse.ArgumentParser(description="Test, Evaluate & Compare Speech Separation Models on NVIDIA CUDA / CPU")
-    parser.add_argument("--snn_checkpoint", type=str, default=None, help="Path to SNN checkpoint (default: auto-detects in checkpoints/)")
-    parser.add_argument("--ann_checkpoint", type=str, default=None, help="Path to ANN model checkpoint (optional)")
-    parser.add_argument("--device", type=str, default="auto", help="Device: 'auto', 'cuda', 'cuda:0', or 'cpu'")
-    parser.add_argument(
-        "--dataset_type",
-        type=str,
-        default=default_train_cfg.dataset_type,
-        choices=["librimix", "mini_librimix", "wav_folder"],
-        help="Dataset type: 'librimix' (default), 'mini_librimix', or 'wav_folder'",
-    )
-    parser.add_argument("--data_dir", type=str, default=default_train_cfg.data_dir, help="Path to Libri2Mix (or MiniLibriMix) dataset")
-    parser.add_argument("--segment_length", type=float, default=default_model_cfg.segment_length, help="Audio segment length in seconds for evaluation")
-    parser.add_argument("--batch_size", type=int, default=default_train_cfg.batch_size, help="Batch size for validation")
-    parser.add_argument("--mixture_type", type=str, default=default_train_cfg.mixture_type, choices=["mix_both", "mix_clean"], help="LibriMix mixture condition: 'mix_both' (noisy) or 'mix_clean' (clean speech only)")
-    parser.add_argument("--max_batches", type=int, default=None, help="Limit number of validation batches (optional)")
+    parser = argparse.ArgumentParser(description="Test and Evaluate Spiking Target Speech Extraction Model")
+    parser.add_argument("--snn_checkpoint", type=str, default=None, help="Path to trained SNN model checkpoint (.pt)")
+    parser.add_argument("--task_mode", type=str, default="tse", help="Task mode: 'tse' (Target Speech Extraction)")
+    parser.add_argument("--device", type=str, default="auto", help="Compute device ('cuda', 'cuda:0', 'cpu', 'auto')")
+    parser.add_argument("--dataset_type", type=str, default="mini_librimix", help="Dataset type: 'librimix', 'mini_librimix'")
+    parser.add_argument("--data_dir", type=str, default="./data/MiniLibriMix", help="Path to dataset directory")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for evaluation")
+    parser.add_argument("--segment_length", type=float, default=2.0, help="Evaluation segment length (seconds)")
+    parser.add_argument("--mixture_type", type=str, default="mix_clean", choices=["mix_both", "mix_clean"], help="Mixture condition")
+    parser.add_argument("--subset", type=str, default="val", choices=["test", "val", "dev"], help="Evaluation subset")
+    parser.add_argument("--max_batches", type=int, default=None, help="Limit number of evaluation batches")
     parser.add_argument("--output_dir", type=str, default="./test_outputs", help="Directory to save test audio & plots")
-    parser.add_argument("--compare_encoders", action="store_true", help="Run benchmark comparing standard and spectrogram encoders")
+    parser.add_argument("--num_talkers", type=int, default=3, choices=[2, 3, 4], help="Number of speakers for multi-talker test (default: 3)")
+    parser.add_argument("--target_talker", type=int, default=0, help="Target speaker index (0-indexed) to extract in multi-talker test")
+    parser.add_argument("--test_multitalker", action="store_true", default=True, help="Run multi-talker (3-4 speakers) cocktail party test")
+    parser.add_argument("--no_multitalker", dest="test_multitalker", action="store_false", help="Disable multi-talker test")
     args = parser.parse_args()
 
     device = resolve_device(args.device)
     gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
-    
+
     print("=" * 68)
-    print("       Spiking Conv-TasNet Speech Separation Model Testing")
+    print("       Spiking Target Speech Extraction (SNN-TSE) Model Testing")
     print("=" * 68)
+    print(f"- Task Mode:       {args.task_mode.upper()} (Target Speech Extraction)")
     print(f"- Device:          {device} ({gpu_name})")
     print(f"- Dataset:         {args.dataset_type} ({args.data_dir})")
+    print(f"- Target Subset:   {args.subset}")
     print(f"- Mixture Type:    {args.mixture_type}")
 
-    # Load Validation Dataset
-    eval_segment_len = args.segment_length
-    print(f"\n[1/3] Preparing Validation Dataset from: {args.data_dir} (Segment length: {eval_segment_len:.1f}s, condition: {args.mixture_type}) ...")
-    _, val_loader = get_dataloaders(
-        dataset_type=args.dataset_type,
-        sample_rate=8000,
-        segment_length=eval_segment_len,
-        batch_size=args.batch_size,
-        data_dir=args.data_dir,
-        mixture_type=args.mixture_type,
-        num_workers=0,
-        pin_memory=(device.type == "cuda"),
-    )
-    print(f"  - Validation pairs: {len(val_loader.dataset)} samples across {len(val_loader)} batches")
-
-    # Encoder Comparison Benchmark Mode
-    if args.compare_encoders:
-        print("\n" + "=" * 80)
-        print("          ENCODER COMPARISON BENCHMARK ON MINILIBRIMIX")
-        print("=" * 80)
-        encoder_candidates = [
-            ("Standard 1-D Conv + Spike", ["checkpoints/best_snn_standard.pt", "checkpoints/best_snn_standard_plif.pt"]),
-            ("STFT Spectrogram + iSTFT", ["checkpoints/best_snn_spectrogram.pt", "checkpoints/best_snn_spectrogram_plif.pt"]),
-        ]
-
-        benchmark_rows = []
-        loaded_models = []
-        for name, candidate_paths in encoder_candidates:
-            ckpt_path = None
-            for p in candidate_paths:
-                if os.path.exists(p):
-                    ckpt_path = p
-                    break
-
-            if ckpt_path is None:
-                print(f"  [Skip] Checkpoint not found for '{name}' (checked: {', '.join(candidate_paths)})")
-                continue
-
-            print(f"\n---> Evaluating [{name}] ({ckpt_path}) ...")
-            model, cfg, meta = load_model(ckpt_path, device=device)
-            n_params = sum(p.numel() for p in model.parameters())
-            results = evaluate_model(model, val_loader, device=device, max_batches=args.max_batches)
-            benchmark_rows.append({
-                "name": name,
-                "encoder_type": getattr(cfg, "encoder_type", "unknown"),
-                "params": n_params,
-                "out_sisdr": results["mean_output_sisdr"],
-                "sisdri": results["mean_sisdri"],
-                "latency": results["avg_latency_per_sample_ms"],
-            })
-            loaded_models.append((name, model, cfg))
-
-        if benchmark_rows:
-            print("\n" + "=" * 88)
-            print(f"{'Encoder Architecture':<30} | {'Out SI-SDR':<12} | {'SI-SNRi':<12} | {'Params':<10} | {'Latency':<12}")
-            print("-" * 88)
-            for r in benchmark_rows:
-                print(f"{r['name']:<30} | {r['out_sisdr']:>9.2f} dB | {r['sisdri']:>9.2f} dB | {r['params']:>10,} | {r['latency']:>8.1f} ms")
-            print("=" * 88)
-
-            # Generate individual outputs for each encoder in its dedicated subfolder
-            print(f"\n[Generating Subfolder Outputs for Each Encoder in: {args.output_dir}] ...")
-            os.makedirs(args.output_dir, exist_ok=True)
-            criterion = PITLossWrapper(loss_fn=NegSISDRLoss(), num_sources=2)
-
-            mix_batch, target_batch = next(iter(val_loader))
-            mix_batch = mix_batch.to(device, non_blocking=True)
-            target_batch = target_batch.to(device, non_blocking=True)
-
-            x = mix_batch[0:1]  # [1, 1, Time]
-            targets = target_batch[0]  # [2, Time]
-            sr = 8000
-
-            mix_np = x[0, 0].cpu().numpy()
-            targets_np = targets.cpu().numpy()
-
-            model_preds_dict = {}
-            for name, model, cfg in loaded_models:
-                enc_type = getattr(cfg, "encoder_type", "standard").lower()
-                folder_name, enc_dir = get_encoder_folder_info(enc_type, args.output_dir)
-                print(f"\n---> Generating Audio Waves & Separate PNGs for [{name}] in '{enc_dir}' ...")
-                
-                with torch.no_grad():
-                    if enc_type in ["spectrogram", "stft"]:
-                        w, phase = model.encoder(x)
-                        spike_seq = model.spike_encoder(w) if isinstance(model, SpikingConvTasNet) else None
-                        masks = model.separator(spike_seq if spike_seq is not None else w)
-                        w_masked = masks * w.unsqueeze(1)
-                        separated = model.decoder(w_masked, phase=phase, target_length=x.shape[-1])
-                    else:
-                        w = model.encoder(x)
-                        spike_seq = model.spike_encoder(w) if isinstance(model, SpikingConvTasNet) else None
-                        masks = model.separator(spike_seq if spike_seq is not None else w)
-                        w_masked = masks * w.unsqueeze(1)
-                        separated = model.decoder(w_masked, target_length=x.shape[-1])
-
-                    _, best_separated, s_sisdr = criterion(separated, targets.unsqueeze(0))
-                    est_np = best_separated[0].cpu().numpy()
-                    masks_np = masks[0].cpu()
-
-                # Baseline mixture input SI-SDR
-                _, _, in_sisdr = criterion(x.repeat(1, 2, 1), targets.unsqueeze(0))
-                model_preds_dict[name] = {
-                    "est": est_np,
-                    "sisdr": float(s_sisdr.item()),
-                    "sisdri": float(s_sisdr.item() - in_sisdr.item()),
-                }
-
-                # Define categorized subdirectories inside encoder folder
-                audio_dir = os.path.join(enc_dir, "audio")
-                waveform_dir = os.path.join(enc_dir, "waveforms")
-                spec_dir = os.path.join(enc_dir, "spectrograms")
-                mask_dir = os.path.join(enc_dir, "masks")
-                snn_dir = os.path.join(enc_dir, "snn")
-
-                os.makedirs(audio_dir, exist_ok=True)
-                os.makedirs(waveform_dir, exist_ok=True)
-                os.makedirs(spec_dir, exist_ok=True)
-                os.makedirs(mask_dir, exist_ok=True)
-                os.makedirs(snn_dir, exist_ok=True)
-
-                # Save audio files inside this encoder's audio/ subfolder
-                audio_mix_path = os.path.join(audio_dir, "mixture.wav")
-                audio_tgt1_path = os.path.join(audio_dir, "target_speaker1.wav")
-                audio_tgt2_path = os.path.join(audio_dir, "target_speaker2.wav")
-                audio_sep1_path = os.path.join(audio_dir, "separated_speaker1.wav")
-                audio_sep2_path = os.path.join(audio_dir, "separated_speaker2.wav")
-
-                sf.write(audio_mix_path, mix_np, sr)
-                sf.write(audio_tgt1_path, targets_np[0], sr)
-                sf.write(audio_tgt2_path, targets_np[1], sr)
-                sf.write(audio_sep1_path, est_np[0], sr)
-                sf.write(audio_sep2_path, est_np[1], sr)
-
-                # Save separate PNGs inside this encoder's categorized subfolders
-                save_separate_waveforms(
-                    mix_np, targets_np, est_np, sample_rate=sr,
-                    output_dir=waveform_dir,
-                    title_suffix=f"[{name}] (SI-SDR = {s_sisdr.item():.2f} dB)"
-                )
-                save_separate_spectrograms(
-                    mix_np, targets_np, est_np, sample_rate=sr,
-                    output_dir=spec_dir,
-                )
-                save_separate_mask_plots(
-                    masks_np,
-                    output_dir=mask_dir,
-                    title_suffix=f"({name} Masks)"
-                )
-                if spike_seq is not None:
-                    save_separate_snn_raster_plots(spike_seq, output_dir=snn_dir)
-
-            # Generate cross-encoder comparison figures in comparisons/ subfolder
-            comp_dir = os.path.join(args.output_dir, "comparisons")
-            os.makedirs(comp_dir, exist_ok=True)
-            print(f"\n[Generating Cross-Encoder Comparison PNGs in '{comp_dir}'] ...")
-            comp_paths = save_separate_comparison_plots(
-                mix_np, targets_np, model_preds_dict,
-                benchmark_rows=benchmark_rows,
-                sample_rate=sr,
-                output_dir=comp_dir,
-            )
-            for p in comp_paths.values():
-                print(f"  - Comparison PNG:       {p}")
-
-        else:
-            print("  No encoder checkpoints found in 'checkpoints/' directory.")
-            print("  Train the models first using:")
-            print("    python train.py --encoder_type standard")
-            print("    python train.py --encoder_type spectrogram")
-        return
-
-    # Single Model Evaluation Mode
+    # Checkpoint Detection
     ckpt_path = args.snn_checkpoint
     if ckpt_path is None:
         candidates = [
-            "checkpoints/best_snn_standard_plif.pt",
+            "checkpoints/best_snn_tse_spectrogram_plif.pt",
+            "checkpoints/best_snn_tse_spectrogram.pt",
             "checkpoints/best_snn_spectrogram_plif.pt",
-            "checkpoints/best_snn_standard.pt",
             "checkpoints/best_snn_spectrogram.pt",
         ]
         for cand in candidates:
@@ -500,14 +384,16 @@ def main():
         if ckpt_path is None:
             print("\n[Error] No SNN model checkpoint found in 'checkpoints/' directory.")
             print("Please train a model first using: python train.py")
-            print("Or specify a checkpoint path via: python test_model.py --snn_checkpoint <path>")
             return
 
-    print(f"\n[2/3] Loading Model Checkpoint: {ckpt_path} ...")
+    print(f"\n[1/3] Loading Model Checkpoint: {ckpt_path} ...")
     snn_model, snn_config, snn_meta = load_model(ckpt_path, device=device)
     total_snn_params = sum(p.numel() for p in snn_model.parameters())
-    enc_type = getattr(snn_config, "encoder_type", "standard")
+    enc_type = getattr(snn_config, "encoder_type", "spectrogram")
+    actual_task = getattr(snn_config, "task_mode", args.task_mode)
+
     print(f"  - Model Type:       Spiking Conv-TasNet ({enc_type.upper()})")
+    print(f"  - Task Mode:        {actual_task.upper()}")
     print(f"  - Checkpoint Epoch: {snn_meta.get('epoch', 'N/A')}")
     print(f"  - Checkpoint Val SI-SDR: {snn_meta.get('val_sisdr', 0.0):.2f} dB")
     print(f"  - Parameters:       {total_snn_params:,}")
@@ -515,31 +401,59 @@ def main():
     print(f"  - Membrane Decay:   {snn_config.snn_beta}")
     print(f"  - Surrogate Grad:   {snn_config.surrogate}")
 
-    # Evaluate SNN
-    print(f"\n[3/3] Running Comprehensive Evaluation on {device}...")
-    snn_results = evaluate_model(snn_model, val_loader, device=device, max_batches=args.max_batches)
+    # Load Evaluation Dataset
+    print(f"\n[2/3] Preparing Evaluation Dataset ({args.subset}) from: {args.data_dir} ...")
+    _, val_loader = get_dataloaders(
+        dataset_type=args.dataset_type,
+        sample_rate=8000,
+        segment_length=args.segment_length,
+        batch_size=args.batch_size,
+        data_dir=args.data_dir,
+        mixture_type=args.mixture_type,
+        eval_subset=args.subset,
+        num_workers=0,
+        pin_memory=(device.type == "cuda"),
+        task_mode=actual_task,
+    )
+    print(f"  - Evaluation pairs: {len(val_loader.dataset)} samples across {len(val_loader)} batches")
+
+    # Evaluate SNN on Benchmark
+    print(f"\n[3/3] Running Benchmark Evaluation on {device}...")
+    snn_results = evaluate_model(snn_model, val_loader, device=device, task_mode=actual_task, max_batches=args.max_batches)
 
     # Print Summary Table
     print("\n" + "=" * 68)
     print("                    EVALUATION BENCHMARK RESULTS")
     print("=" * 68)
-    print(f"{'Metric':<36} | {'SNN Conv-TasNet':<20}")
+    print(f"{'Metric':<36} | {'SNN Target Speech Extractor':<25}")
     print("-" * 68)
-    print(f"{'Encoder Type':<36} | {enc_type.upper():>20}")
-    print(f"{'Input Mixture SI-SDR (dB)':<36} | {snn_results['mean_input_sisdr']:>17.2f} dB")
-    print(f"{'Separated Output SI-SDR (dB)':<36} | {snn_results['mean_output_sisdr']:>17.2f} dB")
-    print(f"{'SI-SDR Improvement (SI-SNRi)':<36} | {snn_results['mean_sisdri']:>17.2f} dB")
-    print(f"{'Std Dev SI-SDR (dB)':<36} | {snn_results['std_output_sisdr']:>17.2f} dB")
-    print(f"{'Median SI-SDR (dB)':<36} | {snn_results['median_output_sisdr']:>17.2f} dB")
-    print(f"{'Min / Max SI-SDR (dB)':<36} | {snn_results['min_output_sisdr']:.1f} / {snn_results['max_output_sisdr']:.1f} dB")
-    print(f"{'Latency per Sample (ms)':<36} | {snn_results['avg_latency_per_sample_ms']:>17.1f} ms")
+    print(f"{'Task Mode':<36} | {actual_task.upper():>25}")
+    print(f"{'Encoder Type':<36} | {enc_type.upper():>25}")
+    print(f"{'Input Mixture SI-SDR (dB)':<36} | {snn_results['mean_input_sisdr']:>22.2f} dB")
+    print(f"{'Extracted Target SI-SDR (dB)':<36} | {snn_results['mean_output_sisdr']:>22.2f} dB")
+    print(f"{'SI-SDR Improvement (SI-SNRi)':<36} | {snn_results['mean_sisdri']:>22.2f} dB")
+    print(f"{'Std Dev SI-SDR (dB)':<36} | {snn_results['std_output_sisdr']:>22.2f} dB")
+    print(f"{'Median SI-SDR (dB)':<36} | {snn_results['median_output_sisdr']:>22.2f} dB")
+    print(f"{'Latency per Sample (ms)':<36} | {snn_results['avg_latency_per_sample_ms']:>22.1f} ms")
     print("=" * 68)
 
-    # Generate sample audio files and plots in encoder subfolder
-    print(f"\nGenerating Sample Audio and Visual Diagnostic Plots in Encoder Subfolder...")
+    # Generate Dual Target Extraction Samples and Visual Plots
+    print(f"\nGenerating Sample Dual Target Audio and Diagnostic Plots in '{args.output_dir}'...")
     run_sample_separation(snn_model, snn_config, val_loader, device=device, output_dir=args.output_dir)
 
-    print("\n[OK] Model Testing and Evaluation Completed Successfully!")
+    # Multi-Speaker Cocktail Party Test (3 or 4 speakers)
+    if args.test_multitalker:
+        run_multitalker_test(
+            model=snn_model,
+            config=snn_config,
+            device=device,
+            data_dir=args.data_dir,
+            num_talkers=args.num_talkers,
+            target_idx=args.target_talker,
+            output_dir=args.output_dir,
+        )
+
+    print("\n[OK] Model Testing, Multi-Speaker Evaluation, and Visualizations Completed Successfully!")
 
 
 if __name__ == "__main__":

@@ -1,15 +1,13 @@
 """
-Speech Separation Losses and Permutation Invariant Training (uPIT).
+Target Speech Extraction (TSE) Losses and Metrics.
 
 Implements:
 1. Scale-Invariant Signal-to-Distortion Ratio (SI-SDR)
-2. Negative SI-SDR Loss (NegSISDRLoss)
+2. Direct Negative SI-SDR Loss (TargetSISDRLoss)
 3. Multi-Resolution STFT Loss (MultiResolutionSTFTLoss)
-4. Spike Activity Regularization Loss (SpikeActivityRegularization)
-5. Utterance-level Permutation Invariant Training (uPIT) Combined Loss Wrapper (CombinedPITLoss)
+4. Composite Target Speech Extraction Loss (TSECombinedLoss)
 """
 
-import itertools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -147,131 +145,78 @@ class MultiResolutionSTFTLoss(nn.Module):
 
 
 # ==============================================================================
-# 3. Permutation Invariant Training (uPIT) Loss Wrappers
+# 3. Target Speech Extraction (TSE) Losses (Deterministic, No Permutations)
 # ==============================================================================
 
-class PITLossWrapper(nn.Module):
+class TargetSISDRLoss(nn.Module):
     """
-    Utterance-level Permutation Invariant Training (uPIT) Loss Wrapper for single metric.
+    Direct Negative SI-SDR loss for Target Speech Extraction.
+    Evaluates only the extracted target stream against target clean ground truth.
+    Requires no permutation calculations (O(1) complexity).
     """
 
-    def __init__(self, loss_fn: Optional[nn.Module] = None, num_sources: int = 2):
+    def __init__(self, eps: float = 1e-8, zero_mean: bool = True):
         super().__init__()
-        self.loss_fn = loss_fn if loss_fn is not None else NegSISDRLoss()
-        self.num_sources = num_sources
-        self.permutations = list(itertools.permutations(range(num_sources)))
+        self.eps = eps
+        self.zero_mean = zero_mean
 
     def forward(
         self,
-        estimates: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size, num_sources, time_len = estimates.shape
-        assert num_sources == self.num_sources, f"Expected {self.num_sources} sources, got {num_sources}"
+        estimate: torch.Tensor,
+        target: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            estimate: [Batch, 1, Time] or [Batch, Time]
+            target:   [Batch, 1, Time] or [Batch, Time]
 
-        pair_rows = []
-        for i in range(num_sources):
-            pair_cols = []
-            for j in range(num_sources):
-                pair_cols.append(self.loss_fn(estimates[:, i, :], targets[:, j, :]))
-            pair_rows.append(torch.stack(pair_cols, dim=1))
-        pairwise_losses = torch.stack(pair_rows, dim=1)  # [B, num_sources, num_sources]
+        Returns:
+            Tuple of (scalar_loss, per_sample_sisdr_scores)
+        """
+        if estimate.dim() == 3 and estimate.size(1) == 1:
+            estimate = estimate.squeeze(1)
+        if target.dim() == 3 and target.size(1) == 1:
+            target = target.squeeze(1)
 
-        perm_losses = []
-        for perm in self.permutations:
-            loss_for_perm = torch.stack([pairwise_losses[:, perm[j], j] for j in range(num_sources)], dim=0)
-            perm_losses.append(loss_for_perm.mean(dim=0))
-
-        stacked_perm_losses = torch.stack(perm_losses, dim=0)
-        min_losses, best_perm_indices = torch.min(stacked_perm_losses, dim=0)
-
-        # Vectorized permutation reordering via torch.gather (no Python batch loop)
-        perm_tensor = torch.tensor(
-            self.permutations, dtype=torch.long, device=estimates.device
-        )  # [P, K]
-        best_perm_idx = perm_tensor[best_perm_indices]  # [B, K]
-        best_estimates = torch.gather(
-            estimates,
-            dim=1,
-            index=best_perm_idx.unsqueeze(-1).expand(-1, -1, estimates.shape[-1]),
-        )
-
-        sisdr_scores = -min_losses.mean()
-        total_loss = min_losses.mean()
-
-        return total_loss, best_estimates, sisdr_scores
+        sisdr = calculate_sisdr(estimate, target, eps=self.eps, zero_mean=self.zero_mean)
+        loss = -torch.mean(sisdr)
+        return loss, sisdr
 
 
-class CombinedPITLoss(nn.Module):
+class TSECombinedLoss(nn.Module):
     """
-    Composite uPIT Separation Loss:
-        L_total = L_SISDR + mr_stft_weight * L_MR_STFT
-    Evaluates permutations jointly to preserve pitch and temporal alignment.
+    Composite Loss for Target Speech Extraction:
+        L_total = -SI_SDR(est, target) + mr_stft_weight * MR_STFT(est, target)
     """
 
-    def __init__(
-        self,
-        mr_stft_weight: float = 0.5,
-        num_sources: int = 2,
-    ):
+    def __init__(self, mr_stft_weight: float = 0.0):
         super().__init__()
         self.mr_stft_weight = mr_stft_weight
-        self.num_sources = num_sources
-        self.sisdr_loss = NegSISDRLoss()
-        self.mr_stft_loss = MultiResolutionSTFTLoss()
-        self.permutations = list(itertools.permutations(range(num_sources)))
+        self.sisdr_loss = TargetSISDRLoss()
+        self.mr_stft_loss = MultiResolutionSTFTLoss() if mr_stft_weight > 0 else None
 
     def forward(
         self,
-        estimates: torch.Tensor,
-        targets: torch.Tensor,
+        estimate: torch.Tensor,
+        target: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            estimates: [Batch, Num_Sources, Time]
-            targets:   [Batch, Num_Sources, Time]
+            estimate: [Batch, 1, Time] or [Batch, Time]
+            target:   [Batch, 1, Time] or [Batch, Time]
 
         Returns:
-            Tuple (total_loss, best_estimates, sisdr_scores)
+            Tuple of (total_loss, estimate, sisdr_scores)
         """
-        batch_size, num_sources, _ = estimates.shape
+        loss_sisdr, sisdr_scores = self.sisdr_loss(estimate, target)
 
-        # Step 1: Pairwise time-domain SI-SDR computation (fast & near-zero autograd memory)
-        pairwise_sisdr = torch.zeros(batch_size, num_sources, num_sources, device=estimates.device)
-        for i in range(num_sources):
-            for j in range(num_sources):
-                pairwise_sisdr[:, i, j] = self.sisdr_loss(estimates[:, i, :], targets[:, j, :])
-
-        # Step 2: Determine optimal permutation per batch item based on SI-SDR
-        perm_losses = []
-        for perm in self.permutations:
-            loss_for_perm = torch.stack([pairwise_sisdr[:, perm[j], j] for j in range(num_sources)], dim=0)
-            perm_losses.append(loss_for_perm.mean(dim=0))
-
-        stacked = torch.stack(perm_losses, dim=0)
-        min_sisdr_losses, best_perm_indices = torch.min(stacked, dim=0)
-
-        # Vectorized permutation reordering via torch.gather (no Python batch loop)
-        perm_tensor = torch.tensor(
-            self.permutations, dtype=torch.long, device=estimates.device
-        )  # [P, K]
-        best_perm_idx = perm_tensor[best_perm_indices]  # [B, K]
-        best_estimates = torch.gather(
-            estimates,
-            dim=1,
-            index=best_perm_idx.unsqueeze(-1).expand(-1, -1, estimates.shape[-1]),
-        )
-
-        # Step 4: Evaluate expensive Multi-Resolution STFT ONLY on the aligned predictions
-        if self.mr_stft_weight > 0:
-            stft_loss = torch.zeros(batch_size, device=estimates.device)
-            for j in range(num_sources):
-                stft_loss = stft_loss + self.mr_stft_loss(best_estimates[:, j, :], targets[:, j, :])
-            mean_stft_loss = (stft_loss / num_sources).mean()
-            total_loss = min_sisdr_losses.mean() + self.mr_stft_weight * mean_stft_loss
+        if self.mr_stft_loss is not None and self.mr_stft_weight > 0:
+            est_flat = estimate.squeeze(1) if estimate.dim() == 3 and estimate.size(1) == 1 else estimate
+            tgt_flat = target.squeeze(1) if target.dim() == 3 and target.size(1) == 1 else target
+            stft_loss = self.mr_stft_loss(est_flat, tgt_flat)
+            total_loss = loss_sisdr + self.mr_stft_weight * stft_loss
         else:
-            total_loss = min_sisdr_losses.mean()
+            total_loss = loss_sisdr
 
-        mean_sisdr = -min_sisdr_losses.mean()
+        return total_loss, estimate, sisdr_scores
 
-        return total_loss, best_estimates, mean_sisdr

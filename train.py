@@ -7,7 +7,7 @@ Features:
 3. Supports PLIF, ALIF, APLIF, FS-Neuron, and LIF neuron dynamics.
 4. Supports Bit-Plane, Population, Learnable PLIF, and Direct spike encodings.
 5. Continuous Membrane Readout & Continuous Residual Bridge.
-6. Composite uPIT Loss (SI-SDR + Multi-Resolution STFT Auxiliary Loss).
+6. Composite Target Speech Extraction Loss (Direct Target SI-SDR + Multi-Resolution STFT Auxiliary Loss).
 7. Learning rate scheduling, gradient clipping, VRAM telemetry, and validation tracking.
 8. Saves best model checkpoints with full metadata and configuration.
 """
@@ -28,8 +28,8 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
 
 from config import ModelConfig, TrainConfig
-from model import SpikingConvTasNet, build_model
-from losses import NegSISDRLoss, PITLossWrapper, CombinedPITLoss, calculate_sisdr
+from model import SpikingConvTasNet
+from losses import calculate_sisdr, TSECombinedLoss, TargetSISDRLoss
 from dataset import get_dataloaders
 
 
@@ -80,16 +80,27 @@ def train_one_epoch(
     start_time = time.time()
     optimizer.zero_grad()
 
-    for batch_idx, (mix_batch, target_batch) in enumerate(train_loader):
+    for batch_idx, batch in enumerate(train_loader):
         if max_batches and batch_idx >= max_batches:
             break
+
+        if len(batch) == 3:
+            mix_batch, target_batch, spk_embed = batch
+            spk_embed = spk_embed.to(device, non_blocking=True)
+        else:
+            mix_batch, target_batch = batch
+            spk_embed = None
 
         mix_batch = mix_batch.to(device, non_blocking=True)
         target_batch = target_batch.to(device, non_blocking=True)
 
         # Forward pass under AMP Autocast
         with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-            separated = model(mix_batch)
+            if spk_embed is not None:
+                separated = model(mix_batch, spk_embed=spk_embed)
+            else:
+                separated = model(mix_batch)
+
             loss, best_estimates, sisdr_score = criterion(separated, target_batch)
             # Scale loss for gradient accumulation
             loss_scaled = loss / grad_accum_steps
@@ -113,18 +124,18 @@ def train_one_epoch(
                 optimizer.zero_grad()
 
         # SI-SDRi = SI-SDR(estimate, source) - SI-SDR(mixture, source)
-        # Compute mixture baseline SI-SDR (mixture repeated vs each target source)
         with torch.no_grad():
-            mix_repeated = mix_batch.expand_as(target_batch)  # [B, K, T]
+            mix_repeated = mix_batch.expand_as(target_batch)
             mixture_sisdr = calculate_sisdr(
                 mix_repeated.reshape(-1, mix_repeated.shape[-1]).float(),
                 target_batch.reshape(-1, target_batch.shape[-1]).float(),
             ).mean()
-            sisdr_i = sisdr_score - mixture_sisdr
+            sisdr_mean = sisdr_score.mean() if isinstance(sisdr_score, torch.Tensor) else sisdr_score
+            sisdr_i = sisdr_mean - mixture_sisdr
 
         total_loss += loss.item()
-        total_sisdr += sisdr_score.item()
-        total_sisdr_i += sisdr_i.item()
+        total_sisdr += sisdr_mean.item() if isinstance(sisdr_mean, torch.Tensor) else sisdr_mean
+        total_sisdr_i += sisdr_i.item() if isinstance(sisdr_i, torch.Tensor) else sisdr_i
 
         if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == total_batches:
             elapsed = time.time() - start_time
@@ -139,8 +150,8 @@ def train_one_epoch(
                 f"  Epoch [{epoch:02d}/{total_epochs:02d}] | "
                 f"Batch [{batch_idx+1:03d}/{total_batches:03d}] | "
                 f"Loss: {loss.item():6.2f} | "
-                f"SI-SDR: {sisdr_score.item():6.2f} dB | "
-                f"SI-SDRi: {sisdr_i.item():6.2f} dB | "
+                f"SI-SDR: {(sisdr_mean.item() if isinstance(sisdr_mean, torch.Tensor) else sisdr_mean):6.2f} dB | "
+                f"SI-SDRi: {(sisdr_i.item() if isinstance(sisdr_i, torch.Tensor) else sisdr_i):6.2f} dB | "
                 f"Speed: {samples_per_sec:.1f} samples/s"
                 f"{gpu_mem_str}",
                 flush=True,
@@ -163,16 +174,28 @@ def validate(
     amp_enabled = use_amp and (device.type == "cuda")
 
     with torch.no_grad():
-        for batch_idx, (mix_batch, target_batch) in enumerate(val_loader):
+        for batch_idx, batch in enumerate(val_loader):
             if max_batches and batch_idx >= max_batches:
                 break
+
+            if len(batch) == 3:
+                mix_batch, target_batch, spk_embed = batch
+                spk_embed = spk_embed.to(device, non_blocking=True)
+            else:
+                mix_batch, target_batch = batch
+                spk_embed = None
+
             mix_batch = mix_batch.to(device, non_blocking=True)
             target_batch = target_batch.to(device, non_blocking=True)
 
             with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                separated = model(mix_batch)
+                if spk_embed is not None:
+                    separated = model(mix_batch, spk_embed=spk_embed)
+                else:
+                    separated = model(mix_batch)
                 _, _, sisdr_score = criterion(separated, target_batch)
-            val_sisdr_list.append(sisdr_score.item())
+            sisdr_val = sisdr_score.mean().item() if isinstance(sisdr_score, torch.Tensor) else float(sisdr_score)
+            val_sisdr_list.append(sisdr_val)
 
     return float(np.mean(val_sisdr_list)) if val_sisdr_list else 0.0
 
@@ -181,13 +204,13 @@ def main():
     default_model_cfg = ModelConfig()
     default_train_cfg = TrainConfig()
 
-    parser = argparse.ArgumentParser(description="Train SNN Conv-TasNet on Libri2Mix / MiniLibriMix with NVIDIA CUDA & AMP")
+    parser = argparse.ArgumentParser(description="Train SNN Speech Separation Model with STFT Frontend on Libri2Mix / MiniLibriMix")
     parser.add_argument(
         "--encoder_type",
         type=str,
-        default=default_model_cfg.encoder_type,
-        choices=["standard", "spectrogram", "stft"],
-        help="Encoder type: 'standard' (1D Conv+SpikeEncoder) or 'spectrogram' (STFT magnitude+iSTFT)",
+        default="spectrogram",
+        choices=["spectrogram", "stft"],
+        help="Encoder frontend: 'spectrogram' (STFT magnitude + phase preservation)",
     )
     parser.add_argument(
         "--neuron_type",
@@ -230,6 +253,18 @@ def main():
     parser.add_argument("--encoder_channels", type=int, default=default_model_cfg.encoder_channels, help="Number of latent channels N")
     parser.add_argument("--stft_use_projection", dest="stft_use_projection", action="store_true", default=default_model_cfg.stft_use_projection, help="Enable 1x1 Conv projection between STFT bins and encoder_channels")
     parser.add_argument("--no_stft_projection", dest="stft_use_projection", action="store_false", help="Disable projection: direct 1:1 STFT frequency bin masking")
+    parser.add_argument(
+        "--task_mode",
+        type=str,
+        default=default_model_cfg.task_mode,
+        help="Task mode: 'tse' (Target Speech Extraction)",
+    )
+    parser.add_argument(
+        "--spk_cache_path",
+        type=str,
+        default=default_model_cfg.spk_cache_path,
+        help="Path to precomputed speaker embedding cache",
+    )
     parser.add_argument("--device", type=str, default=default_train_cfg.device, help="Device: 'auto', 'cuda', 'cuda:0', or 'cpu'")
     parser.add_argument("--amp", dest="use_amp", action="store_true", default=default_train_cfg.use_amp, help="Enable PyTorch FP16 Automatic Mixed Precision")
     parser.add_argument("--no_amp", dest="use_amp", action="store_false", help="Disable PyTorch AMP (use standard FP32)")
@@ -274,21 +309,17 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     device = resolve_device(args.device)
 
-    # Resolve encoder channels & projection for STFT
+    # Resolve STFT encoder channels & projection
     n_freq = args.stft_n_fft // 2 + 1
-    if args.encoder_type in ["spectrogram", "stft"]:
-        if args.stft_use_projection is False:
-            enc_channels = n_freq
-            use_proj = False
-        elif args.encoder_channels is not None:
-            enc_channels = args.encoder_channels
-            use_proj = (enc_channels != n_freq) if args.stft_use_projection is None else args.stft_use_projection
-        else:
-            enc_channels = n_freq
-            use_proj = False
+    if args.stft_use_projection is False:
+        enc_channels = n_freq
+        use_proj = False
+    elif args.encoder_channels is not None:
+        enc_channels = args.encoder_channels
+        use_proj = (enc_channels != n_freq) if args.stft_use_projection is None else args.stft_use_projection
     else:
-        enc_channels = args.encoder_channels if args.encoder_channels is not None else 64
-        use_proj = True
+        enc_channels = n_freq
+        use_proj = False
 
     # CUDA / Hardware Optimizations
     if device.type == "cuda":
@@ -302,15 +333,14 @@ def main():
         total_vram_gb = 0.0
         cuda_cap = (0, 0)
 
-    if args.encoder_type in ["spectrogram", "stft"]:
-        proj_str = "with 1x1 Conv proj" if use_proj else "direct 1:1 frequency masking"
-        enc_desc = f"STFT Spectrogram (n_fft={args.stft_n_fft}, hop={args.stft_hop_length}, bins={n_freq}, {proj_str})"
-    else:
-        enc_desc = f"1D Conv + SpikeEncoder ({args.spike_encoding})"
+    proj_str = "with 1x1 Conv proj" if use_proj else "direct 1:1 frequency masking"
+    enc_desc = f"STFT Spectrogram (n_fft={args.stft_n_fft}, hop={args.stft_hop_length}, bins={n_freq}, {proj_str})"
 
     print("=" * 68)
     print(f"       Training SNN Conv-TasNet on {args.dataset_type.upper()}")
     print("=" * 68)
+    print(f"- Task Mode:      {args.task_mode.upper()} ({'Target Speech Extraction' if args.task_mode == 'tse' else 'Blind Source Separation'})")
+    print(f"- Output Streams:  {1 if args.task_mode == 'tse' else 2} ('Single target mask' if args.task_mode == 'tse' else '2 speaker masks')")
     print(f"- Dataset:         {args.dataset_type} ({args.data_dir})")
     print(f"- Device:          {device} ({gpu_name})")
     if device.type == "cuda":
@@ -344,6 +374,10 @@ def main():
 
     # Build Model Configuration
     model_config = ModelConfig(
+        task_mode=args.task_mode,
+        num_sources=1 if args.task_mode == "tse" else 2,
+        spk_embed_dim=192 if args.task_mode == "tse" else None,
+        spk_cache_path=args.spk_cache_path,
         sample_rate=8000,
         segment_length=args.segment_length,
         encoder_type=args.encoder_type,
@@ -402,6 +436,8 @@ def main():
         num_workers=safe_num_workers,
         pin_memory=pin_mem,
         train_samples_per_epoch=effective_train_samples,
+        task_mode=args.task_mode,
+        spk_cache_path=args.spk_cache_path,
     )
     print(f"  - Train: {len(train_loader.dataset)} samples across {len(train_loader)} batches (pin_memory={pin_mem}, num_workers={safe_num_workers})")
     print(f"  - Val:   {len(val_loader.dataset)} samples across {len(val_loader)} batches")
@@ -431,11 +467,8 @@ def main():
     total_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     print(f"- Trainable Params:{total_params:,}")
 
-    # Composite Loss: uPIT SI-SDR + Multi-Resolution STFT
-    if args.mr_stft_weight > 0:
-        criterion = CombinedPITLoss(mr_stft_weight=args.mr_stft_weight, num_sources=2)
-    else:
-        criterion = PITLossWrapper(loss_fn=NegSISDRLoss(), num_sources=2)
+    # Loss Function Configuration (Target Speech Extraction)
+    criterion = TSECombinedLoss(mr_stft_weight=args.mr_stft_weight)
 
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if args.lr_scheduler == "cosine":
@@ -445,7 +478,7 @@ def main():
     scaler = torch.amp.GradScaler(device.type, enabled=args.use_amp and (device.type == "cuda")) \
         if (args.use_amp and device.type == "cuda") else None
 
-    checkpoint_name = f"best_snn_{args.encoder_type}_{args.neuron_type}.pt"
+    checkpoint_name = f"best_snn_{args.task_mode}_{args.encoder_type}_{args.neuron_type}.pt"
     checkpoint_path = os.path.join(args.checkpoint_dir, checkpoint_name)
 
     start_epoch = 1

@@ -18,6 +18,7 @@ venv311/
 # NOTE: checkpoints/ is intentionally NOT ignored so model weights are tracked.
 data/
 .dist/
+pretrained_models/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
