@@ -73,8 +73,11 @@ class FastSigmoidSurrogate(torch.autograd.Function):
             threshold = ctx.threshold_val
         slope = ctx.slope
         
-        diff = torch.abs(mem - threshold)
-        grad_input = (grad_output / (1.0 + slope * diff) ** 2).to(mem.dtype)
+        # Calculate in float32 to prevent FP16 squaring overflow (diff >= 26 would overflow FP16 to inf)
+        mem_f = mem.float()
+        thresh_f = threshold.float() if ctx.thresh_is_tensor else threshold
+        diff = torch.abs(mem_f - thresh_f)
+        grad_input = (grad_output.float() / (1.0 + slope * diff) ** 2).to(mem.dtype)
         grad_thresh = None
         if ctx.needs_input_grad[1] and ctx.thresh_is_tensor:
             grad_thresh = _reduce_grad(-grad_input, threshold)
@@ -109,8 +112,12 @@ class ATanSurrogate(torch.autograd.Function):
             threshold = ctx.threshold_val
         alpha = ctx.alpha
         
-        delta = mem - threshold
-        grad_input = (grad_output * (alpha / 2.0) / (1.0 + (math.pi / 2.0 * alpha * delta) ** 2)).to(mem.dtype)
+        # Calculate in float32 to prevent FP16 squaring overflow
+        mem_f = mem.float()
+        thresh_f = threshold.float() if ctx.thresh_is_tensor else threshold
+        delta = mem_f - thresh_f
+        denom = 1.0 + (math.pi / 2.0 * alpha * delta) ** 2
+        grad_input = (grad_output.float() * (alpha / 2.0) / denom).to(mem.dtype)
         grad_thresh = None
         if ctx.needs_input_grad[1] and ctx.thresh_is_tensor:
             grad_thresh = _reduce_grad(-grad_input, threshold)
@@ -143,9 +150,14 @@ class PiecewiseQuadraticSurrogate(torch.autograd.Function):
             threshold = ctx.threshold_val
         width = ctx.width
         
-        diff = mem - threshold
-        mask = (torch.abs(diff) <= width).to(mem.dtype)
-        grad_input = (grad_output * mask * (width - torch.abs(diff)) / (width ** 2)).to(mem.dtype)
+        # Calculate in float32 for numerical stability
+        mem_f = mem.float()
+        thresh_f = threshold.float() if ctx.thresh_is_tensor else threshold
+        diff = mem_f - thresh_f
+        abs_diff = torch.abs(diff)
+        mask = (abs_diff <= width).float()
+        denom = max(width ** 2, 1e-8)
+        grad_input = (grad_output.float() * mask * (width - abs_diff) / denom).to(mem.dtype)
         grad_thresh = None
         if ctx.needs_input_grad[1] and ctx.thresh_is_tensor:
             grad_thresh = _reduce_grad(-grad_input, threshold)
@@ -201,9 +213,9 @@ class LIFNeuron(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         s_d = s.detach()  # Detach reset spike — gradient flows only through threshold crossing
         if self.reset_mechanism == "zero":
-            u_decayed = self.beta * u * (1.0 - s_d) + (1.0 - self.beta) * input_current
+            u_decayed = self.beta * u * (1.0 - s_d) + input_current
         else:
-            u_decayed = self.beta * u - s_d * self.threshold + (1.0 - self.beta) * input_current
+            u_decayed = self.beta * u - s_d * self.threshold + input_current
 
         s_new = self.spike_fn(u_decayed, self.threshold)
         return s_new, u_decayed
@@ -235,7 +247,8 @@ class PLIFNeuron(nn.Module):
         w_beta_val = math.log(init_beta / (1.0 - init_beta))
         self.w_beta = nn.Parameter(torch.full((1, channels, 1), w_beta_val, dtype=torch.float32))
 
-        w_th_val = math.log(math.exp(init_threshold) - 1.0)
+        init_thresh_clamped = max(float(init_threshold), 1e-4)
+        w_th_val = math.log(math.expm1(init_thresh_clamped)) if init_thresh_clamped < 20.0 else init_thresh_clamped
         self.w_th = nn.Parameter(torch.full((1, channels, 1), w_th_val, dtype=torch.float32))
 
     @property
@@ -261,9 +274,9 @@ class PLIFNeuron(nn.Module):
         s_d = s.detach()  # Detach reset spike — gradient flows only through threshold crossing
 
         if self.reset_mechanism == "zero":
-            u_decayed = beta * u * (1.0 - s_d) + (1.0 - beta) * input_current
+            u_decayed = beta * u * (1.0 - s_d) + input_current
         else:
-            u_decayed = beta * u - s_d * v_th + (1.0 - beta) * input_current
+            u_decayed = beta * u - s_d * v_th + input_current
 
         s_new = self.spike_fn(u_decayed, v_th)
         return s_new, u_decayed
@@ -318,9 +331,9 @@ class ALIFNeuron(nn.Module):
         v_th = self.base_threshold + self.beta_ada * a_new
 
         if self.reset_mechanism == "zero":
-            u_decayed = self.beta * u * (1.0 - s_d) + (1.0 - self.beta) * input_current
+            u_decayed = self.beta * u * (1.0 - s_d) + input_current
         else:
-            u_decayed = self.beta * u - s_d * v_th + (1.0 - self.beta) * input_current
+            u_decayed = self.beta * u - s_d * v_th + input_current
 
         s_new = self.spike_fn(u_decayed, v_th)
         return s_new, u_decayed, a_new
@@ -352,7 +365,8 @@ class APLIFNeuron(nn.Module):
         w_beta_val = math.log(init_beta / (1.0 - init_beta))
         self.w_beta = nn.Parameter(torch.full((1, channels, 1), w_beta_val, dtype=torch.float32))
 
-        w_th_val = math.log(math.exp(init_threshold) - 1.0)
+        init_thresh_clamped = max(float(init_threshold), 1e-4)
+        w_th_val = math.log(math.expm1(init_thresh_clamped)) if init_thresh_clamped < 20.0 else init_thresh_clamped
         self.w_th = nn.Parameter(torch.full((1, channels, 1), w_th_val, dtype=torch.float32))
 
         self.w_ada = nn.Parameter(torch.full((1, channels, 1), init_beta_ada, dtype=torch.float32))
@@ -390,9 +404,9 @@ class APLIFNeuron(nn.Module):
         beta = self.beta
 
         if self.reset_mechanism == "zero":
-            u_decayed = beta * u * (1.0 - s_d) + (1.0 - beta) * input_current
+            u_decayed = beta * u * (1.0 - s_d) + input_current
         else:
-            u_decayed = beta * u - s_d * v_th + (1.0 - beta) * input_current
+            u_decayed = beta * u - s_d * v_th + input_current
 
         s_new = self.spike_fn(u_decayed, v_th)
         return s_new, u_decayed, a_new
@@ -428,8 +442,8 @@ class FSNeuron(nn.Module):
             self.register_buffer("base_vth", torch.full((1, channels, 1), base_threshold, dtype=torch.float32))
 
     def get_threshold(self, step_idx: int) -> torch.Tensor:
-        idx = min(step_idx, self.timesteps - 1)
-        scale = torch.abs(self.bit_scale[idx])
+        idx = max(0, min(step_idx, self.timesteps - 1))
+        scale = torch.abs(self.bit_scale[idx]) + 1e-6
         vth = F.softplus(self.base_vth) + 1e-4 if isinstance(self.base_vth, nn.Parameter) else self.base_vth
         return vth * scale
 
@@ -443,8 +457,10 @@ class FSNeuron(nn.Module):
         s: torch.Tensor,
         step_idx: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        s_d = s.detach()  # Detach reset spike — gradient flows only through threshold crossing
+        v_th_reset = self.get_threshold(step_idx - 1) if step_idx > 0 else self.get_threshold(0)
         v_th = self.get_threshold(step_idx)
-        u_decayed = u - s * v_th + input_current
+        u_decayed = u - s_d * v_th_reset + input_current
         s_new = self.spike_fn(u_decayed, v_th)
         return s_new, u_decayed
 
@@ -576,22 +592,22 @@ class SpikingConvBlock1d(nn.Module):
         # 1x1 Pointwise conv projection: [H -> B_conv]
         self.conv1x1_res = nn.Conv1d(hidden_channels, in_channels, kernel_size=1, bias=False)
         self.conv1x1_skip = nn.Conv1d(hidden_channels, in_channels, kernel_size=1, bias=False)
-        # Separate projection for membrane readout — must NOT share weights with conv1x1_skip
-        self.conv1x1_mem = nn.Conv1d(hidden_channels, in_channels, kernel_size=1, bias=False)
         self.norm = nn.GroupNorm(1, in_channels, eps=1e-8)
 
     def forward(
         self,
         spike_seq: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_spikes: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
         """
         Process SNN temporal sequence across all simulation timesteps.
 
         Args:
             spike_seq: Input sequence of shape [Timesteps S, Batch, In_Channels, Latent_Length].
+            return_spikes: If True, also return s2_seq spike tensor.
 
         Returns:
-            Tuple (res_seq, skip_seq, u2_seq):
+            Tuple (res_seq, skip_seq, u2_seq) or (res_seq, skip_seq, u2_seq, s2_seq):
                 - res_seq:  Residual output spikes [S, B, In_Channels, L]
                 - skip_seq: Skip output spikes [S, B, In_Channels, L]
                 - u2_seq:   Membrane potential sequence of hidden layer [S, B, In_Channels, L]
@@ -600,18 +616,19 @@ class SpikingConvBlock1d(nn.Module):
         is_adaptive = any(x in self.neuron_type for x in ["alif", "aplif"])
 
         # Step 1: Vectorized 1x1 input expansion for all S simulation steps
-        flat_x = spike_seq.reshape(s_steps * batch, in_c, l_len)
+        flat_x = spike_seq.reshape(s_steps * batch, in_c, l_len).to(dtype=self.conv1x1_in.weight.dtype)
         flat_h1 = self.norm1(self.conv1x1_in(flat_x))
         h1_seq = flat_h1.reshape(s_steps, batch, self.hidden_channels, l_len)
 
+        dtype = flat_h1.dtype
         # Step 2: Temporal recurrent SNN simulation
-        u1 = torch.zeros(batch, self.hidden_channels, l_len, device=spike_seq.device)
-        s1 = torch.zeros(batch, self.hidden_channels, l_len, device=spike_seq.device)
-        u2 = torch.zeros(batch, self.hidden_channels, l_len, device=spike_seq.device)
-        s2 = torch.zeros(batch, self.hidden_channels, l_len, device=spike_seq.device)
+        u1 = torch.zeros(batch, self.hidden_channels, l_len, dtype=dtype, device=spike_seq.device)
+        s1 = torch.zeros(batch, self.hidden_channels, l_len, dtype=dtype, device=spike_seq.device)
+        u2 = torch.zeros(batch, self.hidden_channels, l_len, dtype=dtype, device=spike_seq.device)
+        s2 = torch.zeros(batch, self.hidden_channels, l_len, dtype=dtype, device=spike_seq.device)
         
-        a1 = torch.zeros(batch, self.hidden_channels, l_len, device=spike_seq.device) if is_adaptive else None
-        a2 = torch.zeros(batch, self.hidden_channels, l_len, device=spike_seq.device) if is_adaptive else None
+        a1 = torch.zeros(batch, self.hidden_channels, l_len, dtype=dtype, device=spike_seq.device) if is_adaptive else None
+        a2 = torch.zeros(batch, self.hidden_channels, l_len, dtype=dtype, device=spike_seq.device) if is_adaptive else None
 
         s2_list = []
         u2_list = []
@@ -624,7 +641,8 @@ class SpikingConvBlock1d(nn.Module):
                 s1, u1 = self.neuron1.step(h1_seq[t], u1, s1, step_idx=t)
 
             # Depthwise conv
-            h2 = self.norm2(self.depthwise_conv(s1))
+            s1_in = s1.to(dtype=self.depthwise_conv.weight.dtype)
+            h2 = self.norm2(self.depthwise_conv(s1_in))
 
             # Neuron 2 step
             if is_adaptive:
@@ -638,8 +656,9 @@ class SpikingConvBlock1d(nn.Module):
         # Step 3: Vectorized residual and skip projections
         s2_seq = torch.stack(s2_list, dim=0)
         u2_raw_seq = torch.stack(u2_list, dim=0)
+        self.last_spikes = s2_seq.detach()
 
-        flat_s2 = s2_seq.reshape(s_steps * batch, self.hidden_channels, l_len)
+        flat_s2 = s2_seq.reshape(s_steps * batch, self.hidden_channels, l_len).to(dtype=self.conv1x1_res.weight.dtype)
         flat_res = self.conv1x1_res(flat_s2)
         flat_skip = self.conv1x1_skip(flat_s2)
 
@@ -649,11 +668,13 @@ class SpikingConvBlock1d(nn.Module):
         skip_seq = flat_skip.reshape(s_steps, batch, in_c, l_len)
 
         if self.return_membrane:
-            flat_u2 = u2_raw_seq.reshape(s_steps * batch, self.hidden_channels, l_len)
-            # Use dedicated membrane projection (conv1x1_mem), not the skip connection weights
-            flat_u_proj = self.conv1x1_mem(flat_u2)
+            flat_u2 = u2_raw_seq.reshape(s_steps * batch, self.hidden_channels, l_len).to(dtype=self.conv1x1_skip.weight.dtype)
+            # Reuse skip connection projection (conv1x1_skip) for membrane readout
+            flat_u_proj = self.conv1x1_skip(flat_u2)
             u_seq = flat_u_proj.reshape(s_steps, batch, in_c, l_len)
         else:
             u_seq = None
 
+        if return_spikes:
+            return res_seq, skip_seq, u_seq, s2_seq
         return res_seq, skip_seq, u_seq

@@ -13,7 +13,9 @@ Features:
 """
 
 from typing import Optional, Tuple
+from dataclasses import asdict, is_dataclass
 import os
+import sys
 import time
 import argparse
 
@@ -71,6 +73,7 @@ def train_one_epoch(
     total_loss = 0.0
     total_sisdr = 0.0
     total_sisdr_i = 0.0
+    total_spike_rate = 0.0
     total_batches = len(train_loader) if max_batches is None else min(len(train_loader), max_batches)
     amp_enabled = use_amp and (device.type == "cuda")
 
@@ -93,15 +96,17 @@ def train_one_epoch(
 
         mix_batch = mix_batch.to(device, non_blocking=True)
         target_batch = target_batch.to(device, non_blocking=True)
+        if target_batch.dim() == 3 and target_batch.size(1) > 1:
+            target_batch = target_batch[:, 0:1]
 
         # Forward pass under AMP Autocast
         with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
             if spk_embed is not None:
-                separated = model(mix_batch, spk_embed=spk_embed)
+                separated, _, spike_seq = model(mix_batch, spk_embed=spk_embed, return_intermediates=True)
             else:
-                separated = model(mix_batch)
+                separated, _, spike_seq = model(mix_batch, return_intermediates=True)
 
-            loss, best_estimates, sisdr_score = criterion(separated, target_batch)
+            loss, best_estimates, sisdr_score = criterion(separated, target_batch, spike_seq=spike_seq)
             # Scale loss for gradient accumulation
             loss_scaled = loss / grad_accum_steps
 
@@ -132,10 +137,12 @@ def train_one_epoch(
             ).mean()
             sisdr_mean = sisdr_score.mean() if isinstance(sisdr_score, torch.Tensor) else sisdr_score
             sisdr_i = sisdr_mean - mixture_sisdr
+            batch_spike_rate = spike_seq.mean().item() if spike_seq is not None else 0.0
 
         total_loss += loss.item()
         total_sisdr += sisdr_mean.item() if isinstance(sisdr_mean, torch.Tensor) else sisdr_mean
         total_sisdr_i += sisdr_i.item() if isinstance(sisdr_i, torch.Tensor) else sisdr_i
+        total_spike_rate += batch_spike_rate
 
         if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == total_batches:
             elapsed = time.time() - start_time
@@ -152,12 +159,13 @@ def train_one_epoch(
                 f"Loss: {loss.item():6.2f} | "
                 f"SI-SDR: {(sisdr_mean.item() if isinstance(sisdr_mean, torch.Tensor) else sisdr_mean):6.2f} dB | "
                 f"SI-SDRi: {(sisdr_i.item() if isinstance(sisdr_i, torch.Tensor) else sisdr_i):6.2f} dB | "
+                f"Spike Rate: {batch_spike_rate * 100:4.1f}% | "
                 f"Speed: {samples_per_sec:.1f} samples/s"
                 f"{gpu_mem_str}",
                 flush=True,
             )
 
-    return total_sisdr / max(total_batches, 1), total_sisdr_i / max(total_batches, 1)
+    return total_sisdr / max(total_batches, 1), total_sisdr_i / max(total_batches, 1), total_spike_rate / max(total_batches, 1)
 
 
 def validate(
@@ -187,6 +195,8 @@ def validate(
 
             mix_batch = mix_batch.to(device, non_blocking=True)
             target_batch = target_batch.to(device, non_blocking=True)
+            if target_batch.dim() == 3 and target_batch.size(1) > 1:
+                target_batch = target_batch[:, 0:1]
 
             with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                 if spk_embed is not None:
@@ -271,7 +281,14 @@ def main():
     parser.add_argument("--checkpointing", dest="use_checkpointing", action="store_true", default=default_model_cfg.use_checkpointing, help="Enable gradient checkpointing (saves ~80% activation VRAM)")
     parser.add_argument("--no_checkpointing", dest="use_checkpointing", action="store_false", help="Disable gradient checkpointing")
     parser.add_argument("--multi_gpu", dest="multi_gpu", action="store_true", default=False, help="Enable DataParallel across multiple GPUs")
-    parser.add_argument("--mask_activation", type=str, default=default_model_cfg.mask_activation, choices=["sigmoid", "softmax", "relu"], help="Mask activation function")
+    parser.add_argument("--mask_type", type=str, default=getattr(default_model_cfg, "mask_type", "complex"), choices=["complex", "magnitude"], help="Masking strategy: 'complex' (cRM) or 'magnitude' (legacy)")
+    parser.add_argument("--complex_mask_bound", type=float, default=getattr(default_model_cfg, "complex_mask_bound", 2.0), help="Hyperbolic tangent scale factor for bounded cRM")
+    parser.add_argument("--mask_activation", type=str, default=default_model_cfg.mask_activation, choices=["sigmoid", "softmax", "relu"], help="Mask activation function (for magnitude mode)")
+    parser.add_argument("--film_mode", type=str, default=getattr(default_model_cfg, "film_mode", "shared_deep"), choices=["shared_deep", "deep", "bottleneck"], help="FiLM conditioning mode: 'shared_deep' (Shared Multi-Scale FiLM), 'deep' (per-block dilated FiLM), or 'bottleneck'")
+    parser.add_argument("--speaker_adapter", dest="use_speaker_adapter", action="store_true", default=getattr(default_model_cfg, "use_speaker_adapter", False), help="Enable trainable residual speaker adapter for ECAPA-TDNN embeddings")
+    parser.add_argument("--no_speaker_adapter", dest="use_speaker_adapter", action="store_false", help="Disable trainable speaker adapter")
+    parser.add_argument("--spk_adapter_hidden_dim", type=int, default=getattr(default_model_cfg, "spk_adapter_hidden_dim", 256), help="Hidden dimension for speaker adapter MLP")
+    parser.add_argument("--spike_reg_weight", type=float, default=default_model_cfg.spike_reg_weight, help="Spike rate regularization penalty weight")
     parser.add_argument("--segment_length", type=float, default=default_model_cfg.segment_length, help="Audio segment duration in seconds")
     parser.add_argument("--epochs", type=int, default=default_train_cfg.epochs, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=default_train_cfg.batch_size, help="Training batch size")
@@ -304,7 +321,12 @@ def main():
     parser.add_argument("--max_val_batches", type=int, default=None, help="Limit number of validation batches (optional)")
     parser.add_argument("--num_threads", type=int, default=default_train_cfg.num_threads, help="Number of CPU threads for PyTorch fallback")
     parser.add_argument("--resume", nargs="?", const="auto", default=None, help="Resume training from checkpoint path or 'auto' for best checkpoint")
+    parser.add_argument("--seed", type=int, default=default_train_cfg.seed, help="Random seed for reproducibility")
     args = parser.parse_args()
+
+    # Deterministic execution
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     device = resolve_device(args.device)
@@ -352,7 +374,11 @@ def main():
     print(f"- Model Type:      SNN")
     print(f"- Encoder Type:    {args.encoder_type.upper()} ({enc_desc})")
     print(f"- Encoder Channels:{enc_channels}")
-    print(f"- Mask Activation: {args.mask_activation}")
+    print(f"- Masking Strategy:{args.mask_type.upper()} ({'Complex Ratio Masking (cRM)' if args.mask_type == 'complex' else 'Magnitude Masking'})")
+    if args.mask_type == "magnitude":
+        print(f"- Mask Activation: {args.mask_activation}")
+    else:
+        print(f"- cRM Bound:       {args.complex_mask_bound} (Tanh scaled)")
     print(f"- Segment Length:  {args.segment_length:.1f}s ({int(args.segment_length * 8000)} samples @ 8kHz)")
     print(f"- Epochs:          {args.epochs}")
     print(f"- Batch Size:      {args.batch_size} (Grad Accum: {args.grad_accum_steps}x -> Effective Batch Size: {args.batch_size * args.grad_accum_steps})")
@@ -370,7 +396,10 @@ def main():
     print(f"- SNN Timesteps S: {args.snn_timesteps}")
     print(f"- SNN Decay Beta:  {args.snn_beta}")
     print(f"- Surrogate Grad:  {args.surrogate}")
-    print(f"- MR-STFT Weight:  {args.mr_stft_weight}")
+    film_desc = "Shared Multi-Scale FiLM" if args.film_mode == "shared_deep" else ("Multi-Scale Per-Block Modulation" if args.film_mode == "deep" else "Single Bottleneck FiLM")
+    print(f"- FiLM Mode:       {args.film_mode.upper()} ({film_desc})")
+    adapter_desc = f"Enabled (Residual MLP 192->{args.spk_adapter_hidden_dim}->192)" if args.use_speaker_adapter else "Disabled (Frozen ECAPA-TDNN)"
+    print(f"- Speaker Adapter: {adapter_desc}")
 
     # Build Model Configuration
     model_config = ModelConfig(
@@ -385,7 +414,12 @@ def main():
         stft_n_fft=args.stft_n_fft,
         stft_hop_length=args.stft_hop_length,
         stft_use_projection=use_proj,
+        mask_type=args.mask_type,
+        complex_mask_bound=args.complex_mask_bound,
         mask_activation=args.mask_activation,
+        film_mode=args.film_mode,
+        use_speaker_adapter=args.use_speaker_adapter,
+        spk_adapter_hidden_dim=args.spk_adapter_hidden_dim,
         neuron_type=args.neuron_type,
         spike_encoding=args.spike_encoding,
         population_factor=args.population_factor,
@@ -426,19 +460,30 @@ def main():
 
     print(f"\n[1/3] Loading {args.dataset_type.upper()} dataset from: {args.data_dir} (condition: {args.mixture_type}) ...")
     effective_train_samples = args.train_samples_per_epoch if args.train_samples_per_epoch > 0 else None
-    train_loader, val_loader = get_dataloaders(
-        dataset_type=args.dataset_type,
-        sample_rate=model_config.sample_rate,
-        segment_length=model_config.segment_length,
-        batch_size=args.batch_size,
-        data_dir=args.data_dir,
-        mixture_type=args.mixture_type,
-        num_workers=safe_num_workers,
-        pin_memory=pin_mem,
-        train_samples_per_epoch=effective_train_samples,
-        task_mode=args.task_mode,
-        spk_cache_path=args.spk_cache_path,
-    )
+    try:
+        train_loader, val_loader = get_dataloaders(
+            dataset_type=args.dataset_type,
+            sample_rate=model_config.sample_rate,
+            segment_length=model_config.segment_length,
+            batch_size=args.batch_size,
+            data_dir=args.data_dir,
+            mixture_type=args.mixture_type,
+            num_workers=safe_num_workers,
+            pin_memory=pin_mem,
+            train_samples_per_epoch=effective_train_samples,
+            task_mode=args.task_mode,
+            spk_cache_path=args.spk_cache_path,
+        )
+    except Exception as e:
+        print(f"\n[Error] Failed to load dataset from '{args.data_dir}': {e}")
+        print("Please verify the dataset directory or download MiniLibriMix using:")
+        print("  python scripts/setup_data.py --storage_dir ./data")
+        sys.exit(1)
+
+    if len(train_loader.dataset) == 0:
+        print(f"\n[Error] Dataset in '{args.data_dir}' contains 0 training samples.")
+        sys.exit(1)
+
     print(f"  - Train: {len(train_loader.dataset)} samples across {len(train_loader)} batches (pin_memory={pin_mem}, num_workers={safe_num_workers})")
     print(f"  - Val:   {len(val_loader.dataset)} samples across {len(val_loader)} batches")
 
@@ -468,7 +513,7 @@ def main():
     print(f"- Trainable Params:{total_params:,}")
 
     # Loss Function Configuration (Target Speech Extraction)
-    criterion = TSECombinedLoss(mr_stft_weight=args.mr_stft_weight)
+    criterion = TSECombinedLoss(mr_stft_weight=args.mr_stft_weight, spike_reg_weight=args.spike_reg_weight)
 
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if args.lr_scheduler == "cosine":
@@ -489,16 +534,20 @@ def main():
         resume_target = checkpoint_path if args.resume == "auto" else args.resume
         if os.path.exists(resume_target):
             print(f"[Resume] Loading checkpoint from: {resume_target}")
-            ckpt = torch.load(resume_target, map_location=device, weights_only=False)
-            raw_model.load_state_dict(ckpt["model_state_dict"])
-            if "optimizer_state_dict" in ckpt:
-                try:
-                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                except Exception as e:
-                    print(f"[Resume] Warning: Could not restore optimizer state ({e}). Using fresh optimizer.")
-            start_epoch = ckpt.get("epoch", 0) + 1
-            best_val_sisdr = ckpt.get("val_sisdr", -float("inf"))
-            print(f"[Resume] Resumed successfully. Starting at Epoch {start_epoch}, previous best Val SI-SDR: {best_val_sisdr:.2f} dB")
+            try:
+                ckpt = torch.load(resume_target, map_location=device, weights_only=False)
+                raw_model.load_state_dict(ckpt["model_state_dict"])
+                if "optimizer_state_dict" in ckpt:
+                    try:
+                        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                    except Exception as e:
+                        print(f"[Resume] Warning: Could not restore optimizer state ({e}). Using fresh optimizer.")
+                start_epoch = ckpt.get("epoch", 0) + 1
+                best_val_sisdr = ckpt.get("val_sisdr", -float("inf"))
+                print(f"[Resume] Resumed successfully. Starting at Epoch {start_epoch}, previous best Val SI-SDR: {best_val_sisdr:.2f} dB")
+            except Exception as e:
+                print(f"\n[Error] Failed to load checkpoint for resume from '{resume_target}': {e}")
+                sys.exit(1)
         else:
             print(f"[Resume] Warning: Checkpoint '{resume_target}' not found. Starting from scratch.")
 
@@ -508,7 +557,7 @@ def main():
         epoch_start = time.time()
         print(f"\n--- Epoch {epoch}/{args.epochs} ---")
 
-        train_sisdr, train_sisdr_i = train_one_epoch(
+        train_sisdr, train_sisdr_i, train_spike_rate = train_one_epoch(
             model=model,
             train_loader=train_loader,
             criterion=criterion,
@@ -542,6 +591,7 @@ def main():
         print(
             f"Epoch {epoch:02d} Summary [{epoch_time:.1f}s] | "
             f"Train SI-SDR: {train_sisdr:6.2f} dB | Train SI-SDRi: {train_sisdr_i:6.2f} dB | "
+            f"Spike Rate: {train_spike_rate * 100:4.1f}% | "
             f"Val SI-SDR: {val_sisdr:6.2f} dB | "
             f"LR: {current_lr:.6f}",
             flush=True,
@@ -556,6 +606,7 @@ def main():
                 "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "model_config": model_config,
+                "model_config_dict": asdict(model_config) if is_dataclass(model_config) else getattr(model_config, "__dict__", {}),
                 "val_sisdr": val_sisdr,
                 "device": str(device),
             }

@@ -6,11 +6,13 @@ Implements:
    (PLIF, ALIF, APLIF, FS-Neuron, LIF), continuous membrane potential readout, and continuous residual bridge.
 """
 
+import math
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from typing import List, Optional, Tuple
 from snn import SpikingConvBlock1d
+from speaker_encoder import SpeakerAdapter
 
 
 # ==============================================================================
@@ -41,17 +43,20 @@ class SpikingTCNSeparator(nn.Module):
         snn_readout (str): 'membrane', 'weighted_bit', or 'rate'. Default: 'membrane'.
         use_residual_bridge (bool): Add continuous linear bridge from continuous latent features. Default: True.
         surrogate (str): Surrogate gradient function ('fast_sigmoid', 'atan', 'piecewise'). Default: 'fast_sigmoid'.
+        mask_type (str): 'complex' (cRM) or 'magnitude' (legacy). Default: 'complex'.
+        n_freq (Optional[int]): Number of STFT frequency bins if complex masking is used. Default: None.
+        complex_mask_bound (float): Bounded tanh scaling for complex ratio mask. Default: 2.0.
     """
 
     def __init__(
         self,
-        in_channels: int = 64,
-        bottleneck_channels: int = 64,
-        hidden_channels: int = 128,
+        in_channels: int = 128,
+        bottleneck_channels: int = 128,
+        hidden_channels: int = 256,
         kernel_size: int = 3,
         dilations: Optional[List[int]] = None,
         num_repeats: int = 2,
-        num_sources: int = 2,
+        num_sources: int = 1,
         mask_activation: str = "sigmoid",
         neuron_type: str = "plif",
         beta: float = 0.9,
@@ -62,6 +67,12 @@ class SpikingTCNSeparator(nn.Module):
         surrogate: str = "fast_sigmoid",
         use_checkpointing: bool = True,
         spk_embed_dim: Optional[int] = None,
+        mask_type: str = "complex",
+        n_freq: Optional[int] = None,
+        complex_mask_bound: float = 2.0,
+        film_mode: str = "shared_deep",
+        use_speaker_adapter: bool = False,
+        spk_adapter_hidden_dim: int = 256,
     ):
         super().__init__()
         if dilations is None:
@@ -78,14 +89,36 @@ class SpikingTCNSeparator(nn.Module):
         self.use_residual_bridge = use_residual_bridge
         self.use_checkpointing = use_checkpointing
         self.spk_embed_dim = spk_embed_dim
+        self.film_mode = film_mode.lower()
+        self.use_speaker_adapter = use_speaker_adapter
 
-        # Neuromodulatory FiLM Conditioning Projection for Target Speech Extraction
-        if spk_embed_dim is not None and spk_embed_dim > 0:
-            self.film_proj = nn.Linear(spk_embed_dim, 2 * bottleneck_channels)
-            nn.init.zeros_(self.film_proj.bias)
-            nn.init.normal_(self.film_proj.weight, std=0.02)
+        # Trainable Residual Speaker Voiceprint Adapter
+        if self.use_speaker_adapter and spk_embed_dim is not None and spk_embed_dim > 0:
+            self.speaker_adapter = SpeakerAdapter(embed_dim=spk_embed_dim, hidden_dim=spk_adapter_hidden_dim)
         else:
-            self.film_proj = None
+            self.speaker_adapter = None
+
+        # Neuromodulatory FiLM Conditioning Projections for Target Speech Extraction
+        self.film_proj = None
+        self.shared_film_proj = None
+        self.block_film_projs = None
+
+        if spk_embed_dim is not None and spk_embed_dim > 0:
+            if self.film_mode == "shared_deep":
+                # Single Shared Multi-Scale FiLM generator across all 12 dilation blocks (~49k params)
+                self.shared_film_proj = nn.Linear(spk_embed_dim, 2 * bottleneck_channels)
+                nn.init.zeros_(self.shared_film_proj.bias)
+                nn.init.normal_(self.shared_film_proj.weight, std=0.01)
+            elif self.film_mode == "deep":
+                # Legacy unshared block FiLM (593k params) + bottleneck FiLM (49k params)
+                self.film_proj = nn.Linear(spk_embed_dim, 2 * bottleneck_channels)
+                nn.init.zeros_(self.film_proj.bias)
+                nn.init.normal_(self.film_proj.weight, std=0.02)
+            elif self.film_mode == "bottleneck":
+                # Legacy single FiLM on bottleneck
+                self.film_proj = nn.Linear(spk_embed_dim, 2 * bottleneck_channels)
+                nn.init.zeros_(self.film_proj.bias)
+                nn.init.normal_(self.film_proj.weight, std=0.02)
 
         # Bottleneck 1x1 conv: [N -> B_conv]
         self.bottleneck_conv = nn.Conv1d(in_channels, bottleneck_channels, kernel_size=1, bias=False)
@@ -117,13 +150,46 @@ class SpikingTCNSeparator(nn.Module):
                 )
                 self.blocks.append(block)
 
-        # Output mask generator: [B_conv -> K * N]
-        self.mask_conv = nn.Conv1d(
-            bottleneck_channels,
-            num_sources * in_channels,
-            kernel_size=1,
-            bias=True,
-        )
+        # Legacy Deep Multi-Scale FiLM Projections: one dedicated affine generator per TCN block
+        if self.film_mode == "deep" and spk_embed_dim is not None and spk_embed_dim > 0:
+            self.block_film_projs = nn.ModuleList([
+                nn.Linear(spk_embed_dim, 2 * bottleneck_channels)
+                for _ in range(len(self.blocks))
+            ])
+            for proj in self.block_film_projs:
+                nn.init.zeros_(proj.bias)
+                nn.init.normal_(proj.weight, std=0.01)
+
+        self.mask_type = mask_type.lower()
+        self.complex_mask_bound = complex_mask_bound
+        self.target_freq = n_freq if n_freq is not None else in_channels
+
+        # Output mask generator
+        if self.mask_type == "complex":
+            # Real and imaginary mask channels per source: [B_conv -> 2 * K * target_freq]
+            out_mask_channels = 2 * num_sources * self.target_freq
+            self.mask_conv = nn.Conv1d(
+                bottleneck_channels,
+                out_mask_channels,
+                kernel_size=1,
+                bias=True,
+            )
+            # Initialize with small normal weights for stable start
+            nn.init.normal_(self.mask_conv.weight, std=0.01)
+            # Initialize bias for identity pass-through at step 0 (M_r = 1.0, M_i = 0.0)
+            init_r_bias = math.atanh(min(0.99, 1.0 / max(1.01, self.complex_mask_bound)))
+            with torch.no_grad():
+                bias_view = self.mask_conv.bias.view(num_sources, 2, self.target_freq)
+                bias_view[:, 0, :].fill_(init_r_bias)
+                bias_view[:, 1, :].fill_(0.0)
+        else:
+            # Legacy magnitude mask: [B_conv -> K * N]
+            self.mask_conv = nn.Conv1d(
+                bottleneck_channels,
+                num_sources * in_channels,
+                kernel_size=1,
+                bias=True,
+            )
 
         if mask_activation == "relu":
             self.activation = nn.ReLU()
@@ -159,8 +225,17 @@ class SpikingTCNSeparator(nn.Module):
         """
         s_steps, batch, n_chan, l_len = spike_seq.shape
 
+        # Step 0: Ensure speaker embedding shape, device, and dtype match expectation
+        if spk_embed is not None:
+            if spk_embed.dim() == 3 and spk_embed.size(1) == 1:
+                spk_embed = spk_embed.squeeze(1)
+            target_dtype = self.bottleneck_conv.weight.dtype
+            spk_embed = spk_embed.to(dtype=target_dtype, device=spike_seq.device)
+            if self.speaker_adapter is not None:
+                spk_embed = self.speaker_adapter(spk_embed)
+
         # Step 1: Apply bottleneck 1x1 conv to each simulation timestep
-        flat_spikes = spike_seq.reshape(s_steps * batch, n_chan, l_len)
+        flat_spikes = spike_seq.reshape(s_steps * batch, n_chan, l_len).to(dtype=self.bottleneck_conv.weight.dtype)
         flat_bottleneck = self.bottleneck_norm(self.bottleneck_conv(flat_spikes))
         x_seq = flat_bottleneck.reshape(s_steps, batch, self.bottleneck_channels, l_len)
 
@@ -175,12 +250,30 @@ class SpikingTCNSeparator(nn.Module):
             # Broadcast across simulation timesteps S: [S, B, B_conv, L]
             x_seq = x_seq * gamma.unsqueeze(0) + beta.unsqueeze(0)
 
-        # Step 2: Pass through stacked spiking dilated conv blocks
+        # Shared Multi-Scale FiLM generator across all 12 dilation blocks
+        shared_gamma, shared_beta = None, None
+        if self.shared_film_proj is not None and spk_embed is not None:
+            film_params = self.shared_film_proj(spk_embed)  # [B, 2 * B_conv]
+            g, b = film_params.chunk(2, dim=-1)
+            shared_gamma = (torch.sigmoid(g) * 2.0).unsqueeze(-1)  # [B, B_conv, 1]
+            shared_beta = b.unsqueeze(-1)                          # [B, B_conv, 1]
+
+        # Step 2: Pass through stacked spiking dilated conv blocks with multi-scale FiLM
         skip_total = torch.zeros_like(x_seq)
         u_total = torch.zeros_like(x_seq) if self.snn_readout == "membrane" else None
         current_res = x_seq
 
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            # FiLM modulation across dilation blocks:
+            if shared_gamma is not None and shared_beta is not None:
+                current_res = current_res * shared_gamma.unsqueeze(0) + shared_beta.unsqueeze(0)
+            elif self.block_film_projs is not None and spk_embed is not None:
+                film_params_i = self.block_film_projs[i](spk_embed)
+                gamma_i, beta_i = film_params_i.chunk(2, dim=-1)
+                gamma_i = (torch.sigmoid(gamma_i) * 2.0).unsqueeze(-1)
+                beta_i = beta_i.unsqueeze(-1)
+                current_res = current_res * gamma_i.unsqueeze(0) + beta_i.unsqueeze(0)
+
             if self.use_checkpointing and self.training and current_res.requires_grad:
                 current_res, skip, u_block = checkpoint(block, current_res, use_reentrant=False)
             else:
@@ -191,6 +284,13 @@ class SpikingTCNSeparator(nn.Module):
                 u_total = u_total + u_block
 
         total_features = skip_total + current_res
+
+        # Collect SNN block spikes across all 12 blocks for telemetry
+        block_spikes = [getattr(b, "last_spikes", None) for b in self.blocks]
+        if all(bs is not None for bs in block_spikes):
+            self.last_spikes = torch.cat(block_spikes, dim=2)
+        else:
+            self.last_spikes = None
 
         # Step 3: Temporal Readout Strategy
         if self.snn_readout == "membrane":
@@ -209,21 +309,30 @@ class SpikingTCNSeparator(nn.Module):
 
         # Step 4: Inject Continuous Residual Bridge if configured and continuous_w is supplied
         if self.bridge_conv is not None and continuous_w is not None:
-            bridge_feats = self.bridge_norm(self.bridge_conv(continuous_w))
-            if gamma is not None and beta is not None:
-                bridge_feats = bridge_feats * gamma + beta
+            w_in = continuous_w.to(dtype=self.bridge_conv.weight.dtype, device=spike_seq.device)
+            bridge_feats = self.bridge_norm(self.bridge_conv(w_in))
+            eff_gamma = gamma if gamma is not None else shared_gamma
+            eff_beta = beta if beta is not None else shared_beta
+            if eff_gamma is not None and eff_beta is not None:
+                bridge_feats = bridge_feats * eff_gamma + eff_beta
             readout = readout + bridge_feats
 
-        # Step 5: Generate masks: [B, B_conv, L] -> [B, K * N, L]
+        # Step 5: Generate masks
         mask_raw = self.mask_conv(readout)
 
-        # Reshape to [B, K, N, L]
-        masks = mask_raw.reshape(batch, self.num_sources, self.in_channels, l_len)
-
-        masks = self.activation(masks)
+        if self.mask_type == "complex":
+            # Reshape to [Batch, Num_Sources, 2 (real, imag), Target_Freq, Latent_Length]
+            masks_reshaped = mask_raw.reshape(batch, self.num_sources, 2, self.target_freq, l_len)
+            mask_r = self.complex_mask_bound * torch.tanh(masks_reshaped[:, :, 0])
+            mask_i = self.complex_mask_bound * torch.tanh(masks_reshaped[:, :, 1])
+            masks = torch.stack([mask_r, mask_i], dim=2)  # [B, K, 2, F, L]
+        else:
+            # Reshape to [B, K, N, L]
+            masks = mask_raw.reshape(batch, self.num_sources, self.in_channels, l_len)
+            masks = self.activation(masks)
 
         if verbose:
-            print(f"[SpikingTCNSeparator ({self.neuron_type.upper()}/{self.snn_readout})] Spikes in: {spike_seq.shape} -> Masks out: {masks.shape}")
+            print(f"[SpikingTCNSeparator ({self.neuron_type.upper()}/{self.snn_readout})] Spikes in: {spike_seq.shape} -> Masks out ({self.mask_type}): {masks.shape}")
 
         return masks
 

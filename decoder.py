@@ -35,6 +35,7 @@ class SpectrogramDecoder(nn.Module):
         window: str = "hann",
         encoder_channels: int = 64,
         use_projection: bool = True,
+        mask_type: str = "complex",
     ):
         super().__init__()
         self.n_fft = n_fft
@@ -43,6 +44,7 @@ class SpectrogramDecoder(nn.Module):
         self.n_freq = self.n_fft // 2 + 1
         self.encoder_channels = encoder_channels
         self.use_projection = use_projection
+        self.mask_type = mask_type.lower()
 
         # Create and register STFT synthesis window
         if window.lower() == "hamming":
@@ -52,7 +54,8 @@ class SpectrogramDecoder(nn.Module):
         self.register_buffer("window", win_tensor)
 
         # Unprojection: [encoder_channels N -> n_freq F]
-        if self.use_projection or (self.n_freq != self.encoder_channels):
+        # Not needed for complex ratio masking since complex_spec is synthesized directly from STFT bins
+        if self.mask_type != "complex" and (self.use_projection or (self.n_freq != self.encoder_channels)):
             self.unproj = nn.Conv1d(self.encoder_channels, self.n_freq, kernel_size=1, bias=False)
             self.relu = nn.ReLU()
             nn.init.kaiming_normal_(self.unproj.weight, mode="fan_in")
@@ -62,24 +65,70 @@ class SpectrogramDecoder(nn.Module):
 
     def forward(
         self,
-        w_masked: torch.Tensor,
+        w_masked: Optional[torch.Tensor] = None,
         phase: Optional[torch.Tensor] = None,
         target_length: Optional[int] = None,
         verbose: bool = False,
+        complex_spec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass for Spectrogram Decoder using iSTFT.
 
         Args:
-            w_masked (torch.Tensor): Masked latent features [Batch, Num_Sources, N, Latent_Length]
-                                     or [Batch, N, Latent_Length].
-            phase (torch.Tensor, optional): Mixture STFT phase [Batch, F, Latent_Length].
+            w_masked (torch.Tensor, optional): Masked latent features [Batch, Num_Sources, N, Latent_Length]
+                                               or [Batch, N, Latent_Length] (for magnitude mode).
+            phase (torch.Tensor, optional): Mixture STFT phase [Batch, F, Latent_Length] (for magnitude mode).
             target_length (int, optional): Original waveform length in samples.
             verbose (bool): If True, print tensor shapes.
+            complex_spec (torch.Tensor, optional): Estimated target complex STFT spectrum
+                                                   [Batch, Num_Sources, F, Latent_Length] or [Batch, F, Latent_Length]
+                                                   (for complex ratio masking mode).
 
         Returns:
             torch.Tensor: Reconstructed time-domain audio [Batch, Num_Sources, Time] or [Batch, 1, Time].
         """
+        # Fast path: Direct synthesis from estimated complex STFT (Complex Ratio Masking)
+        if complex_spec is not None:
+            if complex_spec.dim() == 4:
+                b, k, f, l = complex_spec.shape
+                spec_flat = complex_spec.reshape(b * k, f, l)
+            elif complex_spec.dim() == 3:
+                b, f, l = complex_spec.shape
+                k = 1
+                spec_flat = complex_spec
+            else:
+                raise ValueError(f"Unexpected complex_spec dimension: {complex_spec.shape}")
+
+            window = self.window.to(dtype=torch.float32, device=spec_flat.device)
+            if spec_flat.dtype not in (torch.complex64, torch.complex128):
+                spec_flat = spec_flat.cfloat()
+
+            audio_flat = torch.istft(
+                spec_flat,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=window,
+                length=target_length,
+            )
+            time_dim = audio_flat.shape[-1]
+            audio = audio_flat.reshape(b, k, time_dim)
+
+            if target_length is not None:
+                if audio.shape[-1] > target_length:
+                    audio = audio[..., :target_length]
+                elif audio.shape[-1] < target_length:
+                    pad_len = target_length - audio.shape[-1]
+                    audio = nn.functional.pad(audio, (0, pad_len))
+
+            if verbose:
+                print(f"[SpectrogramDecoder (Complex)] Input: {complex_spec.shape} -> Synthesized waveform: {audio.shape}")
+
+            return audio
+
+        if w_masked is None:
+            raise ValueError("Either complex_spec or w_masked must be provided to SpectrogramDecoder.")
+
         is_multi_source = (w_masked.dim() == 4)
 
         if is_multi_source:

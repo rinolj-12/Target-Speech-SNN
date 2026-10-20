@@ -85,8 +85,8 @@ class SpeakerEncoder(nn.Module):
 
         # Extract embeddings using ECAPA-TDNN: [B, 1, 192]
         emb = self.classifier.encode_batch(waveform)
-        emb = emb.squeeze(1)  # [B, 192]
-        emb = F.normalize(emb, p=2, dim=-1)
+        eps = 1e-4 if emb.dtype in (torch.float16, torch.bfloat16) else 1e-12
+        emb = F.normalize(emb, p=2, dim=-1, eps=eps)
         return emb
 
     @torch.no_grad()
@@ -185,3 +185,43 @@ def get_speaker_cache_manager(
     if _DEFAULT_CACHE_MANAGER is None:
         _DEFAULT_CACHE_MANAGER = SpeakerCacheManager(cache_file=cache_file, device=device)
     return _DEFAULT_CACHE_MANAGER
+
+
+# ==============================================================================
+# 3. Trainable Speaker Voiceprint Adapter
+# ==============================================================================
+
+class SpeakerAdapter(nn.Module):
+    """
+    Trainable Residual Adapter for Speaker Voiceprint Embeddings.
+    Adapts pre-trained speaker verification embeddings (e.g. ECAPA-TDNN 192-D)
+    into an optimal feature space tailored specifically for target speech extraction.
+
+    Architecture:
+        x -> LayerNorm(x) -> Linear(D -> H) -> PReLU -> Linear(H -> D) -> Residual(x) -> L2-Norm
+
+    Near-identity start (std=1e-4) ensures initial embeddings match pre-trained ECAPA-TDNN
+    while allowing immediate gradient flow throughout all adapter layers.
+    """
+
+    def __init__(self, embed_dim: int = 192, hidden_dim: int = 256):
+        super().__init__()
+        self.norm = nn.LayerNorm(embed_dim)
+        self.fc1 = nn.Linear(embed_dim, hidden_dim)
+        self.act = nn.PReLU()
+        self.fc2 = nn.Linear(hidden_dim, embed_dim)
+
+        # Initialize: Kaiming on fc1, small normal on fc2 for immediate gradient flow
+        nn.init.kaiming_normal_(self.fc1.weight, nonlinearity="leaky_relu")
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.normal_(self.fc2.weight, std=1e-4)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, spk_embed: torch.Tensor) -> torch.Tensor:
+        # spk_embed: [..., D_spk]
+        h = self.act(self.fc1(self.norm(spk_embed)))
+        out = self.fc2(h)
+        # Residual skip addition + L2-normalization with FP16-safe epsilon floor
+        eps = 1e-4 if spk_embed.dtype in (torch.float16, torch.bfloat16) else 1e-12
+        return F.normalize(spk_embed + out, p=2, dim=-1, eps=eps)
+

@@ -8,7 +8,7 @@ learnable 1x1 1-D convolution projection to match the desired latent channel wid
 
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 
 class SpectrogramEncoder(nn.Module):
@@ -16,8 +16,8 @@ class SpectrogramEncoder(nn.Module):
     Short-Time Fourier Transform (STFT) Spectrogram Encoder.
 
     Transforms raw 1-D time-domain audio mixture waveform into a time-frequency
-    magnitude spectrogram representation W and phase tensor, with optional
-    learnable 1x1 1-D convolution projection to match the desired latent channel width N.
+    magnitude spectrogram representation W, phase tensor, and full complex STFT tensor,
+    with optional learnable 1x1 1-D convolution projection to match the desired latent channel width N.
 
     Args:
         n_fft (int): Size of Fourier Transform (default: 256, e.g. 32ms @ 8kHz).
@@ -64,29 +64,39 @@ class SpectrogramEncoder(nn.Module):
             self.norm = None
             self.relu = None
 
-    def forward(self, x: torch.Tensor, verbose: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        verbose: bool = False,
+        return_complex: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Forward pass computing STFT spectrogram.
 
         Args:
             x (torch.Tensor): Time-domain audio tensor [Batch, 1, Time] or [Batch, Time].
             verbose (bool): If True, print tensor shapes.
+            return_complex (bool): If True, also returns full complex STFT tensor X [Batch, F, Latent_Length].
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
+            Tuple: (w, phase) or (w, phase, complex_stft)
                 - w (torch.Tensor): Magnitude feature representation [Batch, N, Latent_Length].
                 - phase (torch.Tensor): STFT phase angles [Batch, F, Latent_Length] for reconstruction.
+                - complex_stft (torch.Tensor, optional): Full complex STFT tensor [Batch, F, Latent_Length].
         """
         if x.dim() == 3:
             x_flat = x.squeeze(1)  # [B, 1, T] -> [B, T]
         else:
             x_flat = x
 
-        window = self.window.to(dtype=x.dtype, device=x.device)
+        # Ensure STFT runs cleanly in float32 to prevent ComplexHalf warnings
+        # and MKL Half FFT unsupported runtime errors under FP16/AMP
+        x_float = x_flat.float()
+        window = self.window.to(dtype=torch.float32, device=x.device)
         
-        # Compute Complex STFT: [Batch, F, Frames]
+        # Compute Complex STFT: [Batch, F, Frames] in complex64
         X = torch.stft(
-            x_flat,
+            x_float,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,
@@ -99,12 +109,16 @@ class SpectrogramEncoder(nn.Module):
 
         # Project frequency bins F -> N if configured
         if self.proj is not None:
-            w = self.relu(self.norm(self.proj(mag)))
+            proj_in = mag.to(dtype=self.proj.weight.dtype)
+            w = self.relu(self.norm(self.proj(proj_in)))
         else:
-            w = mag
+            w = mag.to(dtype=x.dtype)
 
         if verbose:
             print(f"[SpectrogramEncoder] Waveform {x.shape} -> STFT Mag {mag.shape} -> Latent W {w.shape}")
+
+        if return_complex:
+            return w, phase, X
 
         return w, phase
 

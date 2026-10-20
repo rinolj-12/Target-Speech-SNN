@@ -32,6 +32,17 @@ def calculate_sisdr(
         e_noise  = estimate - s_target
         SI-SDR   = 10 * log10(||s_target||^2 / ||e_noise||^2)
     """
+    # Harmonize shape if tensor has singleton channel dimension [Batch, 1, Time] -> [Batch, Time]
+    if estimate.dim() == 3 and estimate.size(1) == 1:
+        estimate = estimate.squeeze(1)
+    if target.dim() == 3:
+        if target.size(1) == 1:
+            target = target.squeeze(1)
+        elif estimate.dim() == 2 and target.size(1) > 1:
+            # If estimate is a single target stream [Batch, Time] and target has multiple sources [Batch, K, Time],
+            # evaluate against the primary target speaker (Source 0)
+            target = target[:, 0]
+
     estimate = estimate.float()
     target = target.float()
 
@@ -49,7 +60,7 @@ def calculate_sisdr(
     s_target_energy = torch.sum(s_target ** 2, dim=-1) + eps
     e_noise_energy = torch.sum(e_noise ** 2, dim=-1) + eps
 
-    ratio = s_target_energy / e_noise_energy  # both already have +eps; no clamp needed
+    ratio = torch.clamp(s_target_energy / torch.clamp(e_noise_energy, min=eps), min=eps)
     sisdr = 10.0 * torch.log10(ratio)
     return sisdr
 
@@ -175,8 +186,11 @@ class TargetSISDRLoss(nn.Module):
         """
         if estimate.dim() == 3 and estimate.size(1) == 1:
             estimate = estimate.squeeze(1)
-        if target.dim() == 3 and target.size(1) == 1:
-            target = target.squeeze(1)
+        if target.dim() == 3:
+            if target.size(1) == 1:
+                target = target.squeeze(1)
+            elif estimate.dim() == 2 and target.size(1) > 1:
+                target = target[:, 0]
 
         sisdr = calculate_sisdr(estimate, target, eps=self.eps, zero_mean=self.zero_mean)
         loss = -torch.mean(sisdr)
@@ -186,12 +200,21 @@ class TargetSISDRLoss(nn.Module):
 class TSECombinedLoss(nn.Module):
     """
     Composite Loss for Target Speech Extraction:
-        L_total = -SI_SDR(est, target) + mr_stft_weight * MR_STFT(est, target)
+        L_total = -SI_SDR(est, target) + mr_stft_weight * MR_STFT(est, target) + spike_reg_weight * SpikeReg(spike_seq)
     """
 
-    def __init__(self, mr_stft_weight: float = 0.0):
+    def __init__(
+        self,
+        mr_stft_weight: float = 0.0,
+        spike_reg_weight: float = 0.0,
+        target_rate_min: float = 0.15,
+        target_rate_max: float = 0.25,
+    ):
         super().__init__()
         self.mr_stft_weight = mr_stft_weight
+        self.spike_reg_weight = spike_reg_weight
+        self.target_rate_min = target_rate_min
+        self.target_rate_max = target_rate_max
         self.sisdr_loss = TargetSISDRLoss()
         self.mr_stft_loss = MultiResolutionSTFTLoss() if mr_stft_weight > 0 else None
 
@@ -199,11 +222,13 @@ class TSECombinedLoss(nn.Module):
         self,
         estimate: torch.Tensor,
         target: torch.Tensor,
+        spike_seq: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             estimate: [Batch, 1, Time] or [Batch, Time]
             target:   [Batch, 1, Time] or [Batch, Time]
+            spike_seq: Optional SNN spike sequence [S, B, C, L] or [S, ...] for firing rate regularization.
 
         Returns:
             Tuple of (total_loss, estimate, sisdr_scores)
@@ -212,11 +237,20 @@ class TSECombinedLoss(nn.Module):
 
         if self.mr_stft_loss is not None and self.mr_stft_weight > 0:
             est_flat = estimate.squeeze(1) if estimate.dim() == 3 and estimate.size(1) == 1 else estimate
-            tgt_flat = target.squeeze(1) if target.dim() == 3 and target.size(1) == 1 else target
+            if target.dim() == 3:
+                tgt_flat = target[:, 0] if target.size(1) > 1 else target.squeeze(1)
+            else:
+                tgt_flat = target
             stft_loss = self.mr_stft_loss(est_flat, tgt_flat).mean()
             total_loss = loss_sisdr + self.mr_stft_weight * stft_loss
         else:
             total_loss = loss_sisdr
+
+        if spike_seq is not None and self.spike_reg_weight > 0:
+            mean_rate = torch.mean(spike_seq)
+            # Penalize deviation from target healthy firing rate band [target_rate_min, target_rate_max]
+            reg_loss = F.relu(self.target_rate_min - mean_rate) ** 2 + F.relu(mean_rate - self.target_rate_max) ** 2
+            total_loss = total_loss + self.spike_reg_weight * reg_loss
 
         return total_loss, estimate, sisdr_scores
 

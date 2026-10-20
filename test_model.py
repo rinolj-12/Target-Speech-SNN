@@ -10,6 +10,7 @@ Performs:
 """
 
 import os
+import sys
 import argparse
 import time
 from typing import Tuple, Optional, List
@@ -45,7 +46,36 @@ def load_model(checkpoint_path: str, device: torch.device = torch.device("cpu"))
         raise FileNotFoundError(f"Checkpoint not found at '{checkpoint_path}'.")
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    config = checkpoint.get("model_config", ModelConfig())
+    raw_cfg = checkpoint.get("model_config", checkpoint.get("model_config_dict", None))
+    if isinstance(raw_cfg, dict):
+        config = ModelConfig(**{k: v for k, v in raw_cfg.items() if hasattr(ModelConfig, k)})
+    elif isinstance(raw_cfg, ModelConfig):
+        config = raw_cfg
+    else:
+        config = ModelConfig()
+
+    # Auto-detect mask_type directly from the saved mask_conv weight shape
+    state_dict = checkpoint.get("model_state_dict", {})
+    mask_weight = state_dict.get("separator.mask_conv.weight")
+    if mask_weight is not None:
+        if mask_weight.shape[0] == config.num_sources * config.encoder_channels:
+            config.mask_type = "magnitude"
+        elif mask_weight.shape[0] == 2 * config.num_sources * (config.stft_n_fft // 2 + 1):
+            config.mask_type = "complex"
+
+    # Auto-detect Phase 2/3 modules (speaker adapter and deep/shared FiLM) if not explicitly defined
+    if not hasattr(raw_cfg, "use_speaker_adapter") and (not isinstance(raw_cfg, dict) or "use_speaker_adapter" not in raw_cfg):
+        config.use_speaker_adapter = any("separator.speaker_adapter" in k for k in state_dict.keys())
+    if not hasattr(raw_cfg, "film_mode") and (not isinstance(raw_cfg, dict) or "film_mode" not in raw_cfg):
+        has_deep_film = any("separator.block_film_projs" in k for k in state_dict.keys())
+        has_shared_film = any("separator.shared_film_proj" in k for k in state_dict.keys())
+        if has_shared_film:
+            config.film_mode = "shared_deep"
+        elif has_deep_film:
+            config.film_mode = "deep"
+        else:
+            config.film_mode = "bottleneck"
+
     model = SpikingConvTasNet(config)
 
     try:
@@ -117,8 +147,13 @@ def evaluate_model(
             latencies.append((t1 - t0) * 1000.0 / mix_batch.size(0))
 
             # Target Speech Extraction metric calculation
-            out_sisdr = calculate_sisdr(est_sources.squeeze(1), target_batch.squeeze(1))
-            in_sisdr = calculate_sisdr(mix_batch.squeeze(1), target_batch.squeeze(1))
+            if target_batch.dim() == 3 and target_batch.size(1) > 1 and est_sources.size(1) == 1:
+                target_eval = target_batch[:, 0:1]
+            else:
+                target_eval = target_batch
+
+            out_sisdr = calculate_sisdr(est_sources, target_eval)
+            in_sisdr = calculate_sisdr(mix_batch, target_eval)
 
             out_val = out_sisdr.cpu().tolist()
             if isinstance(out_val, list):
@@ -167,36 +202,58 @@ def run_sample_separation(
     batch = next(iter(val_loader))
     dataset = val_loader.dataset
 
-    # Get file paths for sample 0
-    p_mix, p_s1, p_s2 = dataset.pairs[0]
-    s1_full, _ = sf.read(p_s1)
-    s2_full, _ = sf.read(p_s2)
-    mix_full, sr = sf.read(p_mix) if p_mix and os.path.exists(p_mix) else (s1_full[:len(s2_full)] + s2_full[:len(s1_full)], config.sample_rate)
+    if hasattr(dataset, "pairs") and len(dataset.pairs) > 0:
+        p_mix, p_s1, p_s2 = dataset.pairs[0]
+        s1_full, _ = sf.read(p_s1)
+        s2_full, _ = sf.read(p_s2)
+        if s1_full.ndim > 1:
+            s1_full = s1_full.mean(axis=-1)
+        if s2_full.ndim > 1:
+            s2_full = s2_full.mean(axis=-1)
+        mix_full, sr = sf.read(p_mix) if p_mix and os.path.exists(p_mix) else (s1_full[:len(s2_full)] + s2_full[:len(s1_full)], config.sample_rate)
+        if mix_full.ndim > 1:
+            mix_full = mix_full.mean(axis=-1)
 
-    common_len = min(len(s1_full), len(s2_full), len(mix_full), int(config.segment_length * config.sample_rate))
-    s1_clip = s1_full[:common_len]
-    s2_clip = s2_full[:common_len]
-    mix_clip = mix_full[:common_len]
+        common_len = min(len(s1_full), len(s2_full), len(mix_full), int(config.segment_length * config.sample_rate))
+        s1_clip = s1_full[:common_len]
+        s2_clip = s2_full[:common_len]
+        mix_clip = mix_full[:common_len]
 
-    max_v = max(np.max(np.abs(mix_clip)), 1e-7)
-    mix_norm = mix_clip / max_v
-    s1_norm = s1_clip / max_v
-    s2_norm = s2_clip / max_v
+        max_v = max(np.max(np.abs(mix_clip)), 1e-7)
+        mix_norm = mix_clip / max_v
+        s1_norm = s1_clip / max_v
+        s2_norm = s2_clip / max_v
 
-    x = torch.from_numpy(mix_norm).unsqueeze(0).unsqueeze(0).float().to(device)
+        x = torch.from_numpy(mix_norm).unsqueeze(0).unsqueeze(0).float().to(device)
 
-    # Extract embeddings for Speaker 1 and Speaker 2
-    f1 = os.path.basename(p_s1).replace(".wav", "").replace(".flac", "")
-    parts1 = f1.split("_")
-    spk1_id = parts1[0].split("-")[0]
-    spk2_id = parts1[1].split("-")[0] if len(parts1) > 1 else os.path.basename(p_s2).split("-")[0]
+        # Extract embeddings for Speaker 1 and Speaker 2
+        f1 = os.path.basename(p_s1).replace(".wav", "").replace(".flac", "")
+        parts1 = f1.split("_")
+        spk1_id = parts1[0].split("-")[0]
+        spk2_id = parts1[1].split("-")[0] if len(parts1) > 1 else os.path.basename(p_s2).split("-")[0]
 
-    cache_mgr = getattr(dataset, "cache_manager", None)
-    if cache_mgr is None:
-        cache_mgr = get_speaker_cache_manager(device=str(device))
+        cache_mgr = getattr(dataset, "cache_manager", None)
+        if cache_mgr is None:
+            cache_mgr = get_speaker_cache_manager(device=str(device))
 
-    emb1 = cache_mgr.get_embedding(spk1_id, reference_audio_path=p_s1).unsqueeze(0).to(device)
-    emb2 = cache_mgr.get_embedding(spk2_id, reference_audio_path=p_s2).unsqueeze(0).to(device)
+        emb1 = cache_mgr.get_embedding(spk1_id, reference_audio_path=p_s1).unsqueeze(0).to(device)
+        emb2 = cache_mgr.get_embedding(spk2_id, reference_audio_path=p_s2).unsqueeze(0).to(device)
+    else:
+        # Fallback for custom / WavFolder datasets without .pairs attribute
+        sr = getattr(dataset, "sample_rate", config.sample_rate)
+        if len(batch) == 3:
+            mix_batch, target_batch, spk_embed = batch
+            emb1 = spk_embed[0:1].to(device) if spk_embed is not None else torch.randn(1, config.spk_embed_dim, device=device)
+            emb2 = -emb1
+        else:
+            mix_batch, target_batch = batch
+            emb1 = torch.randn(1, config.spk_embed_dim, device=device)
+            emb2 = -emb1
+
+        mix_norm = mix_batch[0, 0].cpu().numpy()
+        s1_norm = target_batch[0, 0].cpu().numpy()
+        s2_norm = mix_norm - s1_norm
+        x = mix_batch[0:1].to(device)
 
     audio_dir = os.path.join(enc_output_dir, "audio")
     waveform_dir = os.path.join(enc_output_dir, "waveforms")
@@ -269,6 +326,19 @@ def run_multitalker_test(
             for f in sorted(files):
                 if f.endswith((".wav", ".flac")):
                     s1_files.append(os.path.join(root, f))
+                    if len(s1_files) >= num_talkers * 3:
+                        break
+            if len(s1_files) >= num_talkers * 3:
+                break
+
+    # Fallback to any audio files in data_dir if no structured s1/s2 directories exist
+    if len(s1_files) < num_talkers:
+        for root, _, files in os.walk(data_dir):
+            for f in sorted(files):
+                if f.endswith((".wav", ".flac", ".ogg")):
+                    full_p = os.path.join(root, f)
+                    if full_p not in s1_files:
+                        s1_files.append(full_p)
                     if len(s1_files) >= num_talkers * 3:
                         break
             if len(s1_files) >= num_talkers * 3:
@@ -364,10 +434,15 @@ def main():
     parser.add_argument("--max_batches", type=int, default=None, help="Limit number of evaluation batches")
     parser.add_argument("--output_dir", type=str, default="./test_outputs", help="Directory to save test audio & plots")
     parser.add_argument("--num_talkers", type=int, default=3, choices=[2, 3, 4], help="Number of speakers for multi-talker test (default: 3)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic evaluation")
     parser.add_argument("--target_talker", type=int, default=0, help="Target speaker index (0-indexed) to extract in multi-talker test")
     parser.add_argument("--test_multitalker", action="store_true", default=True, help="Run multi-talker (3-4 speakers) cocktail party test")
     parser.add_argument("--no_multitalker", dest="test_multitalker", action="store_false", help="Disable multi-talker test")
     args = parser.parse_args()
+
+    # Deterministic execution
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     device = resolve_device(args.device)
     gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
@@ -381,8 +456,13 @@ def main():
     print(f"- Target Subset:   {args.subset}")
     print(f"- Mixture Type:    {args.mixture_type}")
 
-    # Checkpoint Detection
+    # Checkpoint Detection & Validation
     ckpt_path = args.snn_checkpoint
+    if ckpt_path is not None and not os.path.exists(ckpt_path):
+        print(f"\n[Error] Specified checkpoint not found at '{ckpt_path}'.")
+        print("Please check the file path or train a model first using: python train.py")
+        sys.exit(1)
+
     if ckpt_path is None:
         candidates = [
             "checkpoints/best_snn_tse_spectrogram_plif.pt",
@@ -397,10 +477,15 @@ def main():
         if ckpt_path is None:
             print("\n[Error] No SNN model checkpoint found in 'checkpoints/' directory.")
             print("Please train a model first using: python train.py")
-            return
+            sys.exit(1)
 
     print(f"\n[1/3] Loading Model Checkpoint: {ckpt_path} ...")
-    snn_model, snn_config, snn_meta = load_model(ckpt_path, device=device)
+    try:
+        snn_model, snn_config, snn_meta = load_model(ckpt_path, device=device)
+    except Exception as e:
+        print(f"\n[Error] Failed to load checkpoint from '{ckpt_path}': {e}")
+        sys.exit(1)
+
     total_snn_params = sum(p.numel() for p in snn_model.parameters())
     enc_type = getattr(snn_config, "encoder_type", "spectrogram")
     actual_task = getattr(snn_config, "task_mode", args.task_mode)
@@ -416,18 +501,29 @@ def main():
 
     # Load Evaluation Dataset
     print(f"\n[2/3] Preparing Evaluation Dataset ({args.subset}) from: {args.data_dir} ...")
-    _, val_loader = get_dataloaders(
-        dataset_type=args.dataset_type,
-        sample_rate=8000,
-        segment_length=args.segment_length,
-        batch_size=args.batch_size,
-        data_dir=args.data_dir,
-        mixture_type=args.mixture_type,
-        eval_subset=args.subset,
-        num_workers=0,
-        pin_memory=(device.type == "cuda"),
-        task_mode=actual_task,
-    )
+    try:
+        _, val_loader = get_dataloaders(
+            dataset_type=args.dataset_type,
+            sample_rate=8000,
+            segment_length=args.segment_length,
+            batch_size=args.batch_size,
+            data_dir=args.data_dir,
+            mixture_type=args.mixture_type,
+            eval_subset=args.subset,
+            num_workers=0,
+            pin_memory=(device.type == "cuda"),
+            task_mode=actual_task,
+        )
+    except Exception as e:
+        print(f"\n[Error] Failed to load dataset from '{args.data_dir}': {e}")
+        print("Please verify the dataset directory or download MiniLibriMix using:")
+        print("  python scripts/setup_data.py --storage_dir ./data")
+        sys.exit(1)
+
+    if len(val_loader.dataset) == 0:
+        print(f"\n[Error] Dataset in '{args.data_dir}' contains 0 evaluation samples for subset '{args.subset}'.")
+        sys.exit(1)
+
     print(f"  - Evaluation pairs: {len(val_loader.dataset)} samples across {len(val_loader)} batches")
 
     # Evaluate SNN on Benchmark
@@ -456,11 +552,12 @@ def main():
 
     # Multi-Speaker Cocktail Party Test (3 or 4 speakers)
     if args.test_multitalker:
+        actual_data_dir = getattr(val_loader.dataset, "data_dir", args.data_dir)
         run_multitalker_test(
             model=snn_model,
             config=snn_config,
             device=device,
-            data_dir=args.data_dir,
+            data_dir=actual_data_dir,
             num_talkers=args.num_talkers,
             target_idx=args.target_talker,
             output_dir=args.output_dir,

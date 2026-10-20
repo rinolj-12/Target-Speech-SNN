@@ -27,7 +27,7 @@ class ModelConfig:
     
     # STFT Frontend & Audio Architecture:
     encoder_type: str = "spectrogram" # Dedicated STFT Spectrogram Frontend
-    encoder_channels: int = 64   # N: Projected latent channel dimension for separator interface
+    encoder_channels: int = 128  # N: Projected latent channel dimension for separator interface (preserves 129 STFT frequency bins)
     
     # STFT / Spectrogram Frontend Parameters
     stft_n_fft: int = 256        # FFT size (e.g. 256 = 32ms @ 8kHz -> 129 frequency bins)
@@ -38,7 +38,7 @@ class ModelConfig:
     
     # SNN Neuron & Temporal Dynamics
     neuron_type: str = "plif"    # 'plif', 'alif', 'aplif', 'fs_neuron', 'lif'
-    snn_timesteps: int = 6       # S: Number of simulation timesteps (6 for high temporal fidelity)
+    snn_timesteps: int = 4       # S: Number of simulation timesteps (4 offers optimal temporal fidelity and 33% faster training)
     snn_threshold: float = 0.8   # V_th: Membrane firing threshold (learnable in PLIF/APLIF)
     snn_beta: float = 0.9        # Membrane potential decay factor (learnable in PLIF/APLIF)
     snn_reset_mechanism: str = "subtract"  # 'subtract' (soft) or 'zero' (hard)
@@ -55,6 +55,9 @@ class ModelConfig:
     task_mode: str = "tse"           # Target Speech Extraction ('tse')
     spk_embed_dim: int = 192         # Speaker voiceprint vector dimension from ECAPA-TDNN
     spk_cache_path: str = "./data/minilibrimix_spk_embeddings.pt" # Path to precomputed speaker cache
+    film_mode: str = "shared_deep"   # 'shared_deep' (Shared Multi-Scale FiLM generator), 'deep' (per-block), or 'bottleneck'
+    use_speaker_adapter: bool = False # Trainable residual MLP adapter disabled by default for Libri2Mix (saves 99k params)
+    spk_adapter_hidden_dim: int = 256 # Hidden dimension for speaker adapter MLP
 
     # TCN Separator Architecture (Depthwise Dilated Convolutions)
     bottleneck_channels: int = 128   # B: Channels in bottleneck and residual paths (default matches train.py)
@@ -63,7 +66,9 @@ class ModelConfig:
     dilations: List[int] = field(default_factory=lambda: [1, 2, 4, 8, 16, 32])  # Receptive field > 1.2s
     num_repeats: int = 2             # R: Number of times to repeat the dilation stack
     num_sources: int = 1             # K: 1 output target speaker stream for TSE
-    mask_activation: str = "sigmoid" # 'sigmoid', 'softmax', 'relu'
+    mask_type: str = "complex"       # 'complex' (Complex Ratio Masking - cRM) or 'magnitude' (legacy real magnitude)
+    complex_mask_bound: float = 2.0  # Hyperbolic tangent scale factor for bounded cRM (preserves dynamic range)
+    mask_activation: str = "sigmoid" # Mask activation function for magnitude mode ('sigmoid', 'softmax', 'relu')
     use_checkpointing: bool = True   # Enable gradient checkpointing to reduce activation VRAM by ~80%
     
     # SNN Readout & Residual Bridge
@@ -112,4 +117,13 @@ class TrainConfig:
     checkpoint_dir: str = "./checkpoints"
     output_dir: str = "./outputs"
     seed: int = 42
+
+
+# Register dataclass configs with PyTorch safe globals allowlist for weights_only=True loading
+if hasattr(torch, "serialization") and hasattr(torch.serialization, "add_safe_globals"):
+    try:
+        torch.serialization.add_safe_globals([ModelConfig, TrainConfig])
+    except Exception:
+        pass
+
 

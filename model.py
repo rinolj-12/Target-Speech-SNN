@@ -66,7 +66,10 @@ class SpikingConvTasNet(nn.Module):
         )
 
         # 3. Spiking TCN Separator with selectable neuron dynamics & continuous membrane readout
+        self.mask_type = getattr(config, "mask_type", "complex").lower()
+        self.complex_mask_bound = getattr(config, "complex_mask_bound", 2.0)
         spk_dim = getattr(config, "spk_embed_dim", 192) if getattr(config, "task_mode", "tse") == "tse" else None
+
         self.separator = SpikingTCNSeparator(
             in_channels=config.encoder_channels,
             bottleneck_channels=config.bottleneck_channels,
@@ -85,6 +88,12 @@ class SpikingConvTasNet(nn.Module):
             surrogate=config.surrogate,
             use_checkpointing=getattr(config, "use_checkpointing", True),
             spk_embed_dim=spk_dim,
+            mask_type=self.mask_type,
+            n_freq=self.encoder.n_freq,
+            complex_mask_bound=self.complex_mask_bound,
+            film_mode=getattr(config, "film_mode", "shared_deep"),
+            use_speaker_adapter=getattr(config, "use_speaker_adapter", False),
+            spk_adapter_hidden_dim=getattr(config, "spk_adapter_hidden_dim", 256),
         )
 
         # 4. iSTFT Spectrogram Decoder
@@ -95,6 +104,7 @@ class SpikingConvTasNet(nn.Module):
             window=config.stft_window,
             encoder_channels=config.encoder_channels,
             use_projection=config.stft_use_projection,
+            mask_type=self.mask_type,
         )
 
     def forward(
@@ -134,8 +144,12 @@ class SpikingConvTasNet(nn.Module):
             if spk_embed is not None:
                 print(f"   Target Speaker Voiceprint   : {spk_embed.shape}")
 
-        # Step 1: STFT Spectrogram Encoding (returns latent magnitude W and mixture phase)
-        w, phase = self.encoder(x, verbose=verbose)
+        # Step 1: STFT Spectrogram Encoding
+        if self.mask_type == "complex":
+            w, phase, complex_stft = self.encoder(x, verbose=verbose, return_complex=True)
+        else:
+            w, phase = self.encoder(x, verbose=verbose, return_complex=False)
+            complex_stft = None
 
         # Step 2: Temporal Spike Encoding
         spike_seq = self.spike_encoder(w, verbose=verbose)
@@ -148,23 +162,60 @@ class SpikingConvTasNet(nn.Module):
         bridge_w = w if getattr(self.config, "use_residual_bridge", True) else None
         masks = self.separator(spike_seq, continuous_w=bridge_w, spk_embed=spk_embed, verbose=verbose)
         if verbose:
-            print(f"4. Predicted Speaker Masks M   : {masks.shape} (Sources K={masks.shape[1]})")
+            print(f"4. Predicted Speaker Masks M   : {masks.shape} (Sources K={masks.shape[1]}, Type={self.mask_type})")
 
-        # Step 4: Mask the latent representation W
-        w_expanded = w.unsqueeze(1)
-        w_masked = masks * w_expanded
-        if verbose:
-            print(f"5. Masked Latent Representations: {w_masked.shape}")
+        # Step 4: Masking & Step 5: Synthesis
+        if self.mask_type == "complex":
+            # masks shape: [Batch, Num_Sources, 2 (real, imag), Target_Freq, Latent_Length]
+            mask_r = masks[:, :, 0]  # [B, K, F, L]
+            mask_i = masks[:, :, 1]  # [B, K, F, L]
 
-        # Step 5: iSTFT Spectrogram Synthesis with mixture phase
-        separated_waveforms = self.decoder(w_masked, phase=phase, target_length=orig_time, verbose=verbose)
+            X_r = complex_stft.real.unsqueeze(1)  # [B, 1, F, L]
+            X_i = complex_stft.imag.unsqueeze(1)  # [B, 1, F, L]
+
+            # Complex Ratio Masking: S = M * X = (M_r + j M_i)(X_r + j X_i)
+            # S_r = M_r * X_r - M_i * X_i
+            # S_i = M_r * X_i + M_i * X_r
+            S_hat_r = mask_r * X_r - mask_i * X_i
+            S_hat_i = mask_r * X_i + mask_i * X_r
+            complex_spec = torch.complex(S_hat_r.float(), S_hat_i.float())  # [B, K, F, L]
+
+            if verbose:
+                print(f"5. Estimated Complex Spectrum  : {complex_spec.shape}")
+
+            separated_waveforms = self.decoder(
+                complex_spec=complex_spec,
+                target_length=orig_time,
+                verbose=verbose,
+            )
+            # Effective magnitude mask for visualization and downstream inspection
+            mask_eps = 1e-5 if mask_r.dtype in (torch.float16, torch.bfloat16) else 1e-8
+            effective_mask = torch.sqrt(mask_r ** 2 + mask_i ** 2 + mask_eps)
+        else:
+            # Step 4: Mask the latent representation W
+            w_expanded = w.unsqueeze(1)
+            w_masked = masks * w_expanded
+            if verbose:
+                print(f"5. Masked Latent Representations: {w_masked.shape}")
+
+            # Step 5: iSTFT Spectrogram Synthesis with mixture phase
+            separated_waveforms = self.decoder(w_masked, phase=phase, target_length=orig_time, verbose=verbose)
+            effective_mask = masks
 
         if verbose:
             print(f"6. Separated Output Waveforms   : {separated_waveforms.shape}")
             print("=" * 50 + "\n")
 
+        # SNN block spike telemetry from separator
+        snn_spikes = getattr(self.separator, "last_spikes", None)
+        out_spikes = snn_spikes if snn_spikes is not None else spike_seq
+        self.last_spikes = out_spikes
+
+        # Ensure output matches input tensor dtype
+        separated_waveforms = separated_waveforms.to(dtype=x.dtype)
+
         if return_intermediates:
-            return separated_waveforms, masks, spike_seq
+            return separated_waveforms, effective_mask, out_spikes
 
         return separated_waveforms
 

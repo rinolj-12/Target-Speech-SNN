@@ -55,14 +55,15 @@ class BitPlaneSpikeEncoder(nn.Module):
 
     def forward(self, w: torch.Tensor) -> torch.Tensor:
         # w: [Batch, N, Latent_Length]
-        # Normalize w to [0, 1) range
-        w_norm = torch.clamp(w / (self.max_val + 1e-7), min=0.0, max=0.9999)
+        # Normalize w to [0, 1) range with FP16-safe epsilon floor
+        eps = 1e-4 if w.dtype in (torch.float16, torch.bfloat16) else 1e-7
+        w_norm = torch.clamp(w / (self.max_val + eps), min=0.0, max=0.9999)
         
         remainder = w_norm
         spike_list = []
         
         for t in range(self.timesteps):
-            wt = self.bit_weights[t]
+            wt = self.bit_weights[t].to(dtype=w.dtype, device=w.device)
             # Fire spike if remainder >= wt
             spike_t = self.spike_fn(remainder - wt, 0.0)
             # Subtract fired bit
@@ -112,12 +113,13 @@ class PopulationSpikeEncoder(nn.Module):
         batch, n_chan, l_len = w.shape
         w_expanded = w.unsqueeze(2)  # [B, N, 1, L]
 
-        # Gaussian activation: [B, N, K, L]
-        act = torch.exp(-((w_expanded - self.mu) ** 2) / (2 * (self.sigma ** 2) + 1e-7))
+        # Gaussian activation: [B, N, K, L] with FP16-safe epsilon floor
+        eps = 1e-4 if w.dtype in (torch.float16, torch.bfloat16) else 1e-7
+        act = torch.exp(-((w_expanded - self.mu) ** 2) / (2 * (self.sigma ** 2) + eps))
         
         # Flatten spatial population into channel dimension: [B, N * K, L]
-        flat_act = act.view(batch, n_chan * self.population_size, l_len)
-        projected = self.norm(self.proj(flat_act))  # [B, N, L]
+        flat_act = act.view(batch, n_chan * self.population_size, l_len).to(dtype=self.proj.weight.dtype)
+        projected = self.norm(self.proj(flat_act)).to(dtype=w.dtype)  # [B, N, L]
 
         # Expand (zero-copy view) across S timesteps — avoids allocating a new tensor
         # [S, B, N, L]
@@ -149,10 +151,11 @@ class LearnableSpikeEncoder(nn.Module):
     def forward(self, w: torch.Tensor) -> torch.Tensor:
         # w: [Batch, N, Latent_Length]
         batch, n_chan, l_len = w.shape
-        h = self.norm(self.conv1d(w))  # [B, N, L]
+        w_in = w.to(dtype=self.conv1d.weight.dtype)
+        h = self.norm(self.conv1d(w_in))  # [B, N, L]
 
-        u = torch.zeros(batch, n_chan, l_len, device=w.device)
-        s = torch.zeros(batch, n_chan, l_len, device=w.device)
+        u = torch.zeros(batch, n_chan, l_len, dtype=h.dtype, device=w.device)
+        s = torch.zeros(batch, n_chan, l_len, dtype=h.dtype, device=w.device)
         spike_list = []
 
         for t in range(self.timesteps):
@@ -243,11 +246,12 @@ class SpikeEncoder(nn.Module):
         elif self.encoding_type == "direct_current":
             spike_seq = w.unsqueeze(0).expand(self.timesteps, -1, -1, -1).contiguous()
         elif self.encoding_type == "rate":
-            w_norm = torch.clamp(w / (self.threshold + 1e-7), min=0.0, max=1.0)
+            eps = 1e-4 if w.dtype in (torch.float16, torch.bfloat16) else 1e-7
+            w_norm = torch.clamp(w / (self.threshold + eps), min=0.0, max=1.0)
             probs = w_norm.unsqueeze(0).repeat(self.timesteps, 1, 1, 1)
             spike_seq = torch.bernoulli(probs)
         elif self.encoding_type == "threshold":
-            spike_seq = (w.unsqueeze(0).repeat(self.timesteps, 1, 1, 1) >= self.threshold).float()
+            spike_seq = (w.unsqueeze(0).repeat(self.timesteps, 1, 1, 1) >= self.threshold).to(dtype=w.dtype)
         else:
             raise ValueError(f"Unknown spike encoding type: {self.encoding_type}")
 

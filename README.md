@@ -196,11 +196,11 @@ Mixed Audio x(t)        │                                                │
 │           STAGE 3 — SPIKING TCN SEPARATOR  (FiLM-conditioned)       ││
 │                                                                      ││
 │  Bottleneck 1×1 Conv + GroupNorm: [N=64 → B=128 channels]           ││
-│                           │                                          ││
-│  ┌──── Neuromodulatory FiLM Conditioning ─────────────────────────┐ ││
-│  │  e_target ──► Linear(192 → 256) ──► split ──► (γ_raw, β)      │ ││
-│  │  γ = sigmoid(γ_raw) × 2.0     [range: 0 → 2]                  │ ││
-│  │  Modulate: x ← x × γ + β     (per-channel, all timesteps)     │◄┘│
+│  ┌──── Trainable Speaker Adapter + Multi-Scale Deep FiLM ─────────┐ ││
+│  │  e_target ──► SpeakerAdapter (Residual MLP 192->256->192)      │ ││
+│  │  Modulates Bottleneck AND all 12 Dilated Spiking TCN Blocks!   │ ││
+│  │  γ_i = sigmoid(Linear_i(e)) × 2.0,  β_i = Linear_i(e)          │ ││
+│  │  Modulate: x_i ← x_i × γ_i + β_i  (multi-scale speaker gating) │◄┘│
 │  └────────────────────────────────────────────────────────────────┘  │
 │                           │                                          │
 │  ┌──── Stacked Dilated Spiking TCN Blocks (12 total) ─────────────┐  │
@@ -217,23 +217,26 @@ Mixed Audio x(t)        │                                                │
 │  │  + Residual bridge from continuous W  (bypass path)            │  │
 │  └────────────────────────────────────────────────────────────────┘  │
 │                           │                                          │
-│  1×1 Mask Conv ──► Target Mask M  [B, 1, N=64, L]  (Sigmoid)       │
+│  1×1 Mask Conv ──► Complex Mask M = (M_r, M_i)  [B, 1, 2, F=129, L]  │
+│                   (Bounded Tanh, scale=2.0)                          │
 └──────────────────────────────┬───────────────────────────────────────┘
-                               │  M [B, 1, 64, L]
+                               │  M = (M_r, M_i)
                                ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                  STAGE 4 — MASKING                                   │
+│       STAGE 4 — COMPLEX RATIO MASKING (cRM)                          │
 │                                                                      │
-│  W_target = M ⊙ W                                                    │
-│  [B, 1, 64, L]  =  [B, 1, 64, L]  ×  [B, 64, L]  (broadcast)       │
+│  Ŝ_target = M · X_mixture = (M_r + j·M_i) · (X_r + j·X_i)           │
+│  • Ŝ_r = M_r · X_r  −  M_i · X_i                                     │
+│  • Ŝ_i = M_r · X_i  +  M_i · X_r                                     │
+│  → Modifies BOTH spectral magnitude AND rotates phase to clean voice!│
 └──────────────────────────────┬───────────────────────────────────────┘
-                               │  W_target [B, 1, 64, L]
+                               │  Ŝ_target ∈ ℂ^[B, 1, 129, L]
                                ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │               STAGE 5 — iSTFT SPECTROGRAM DECODER                   │
 │                                                                      │
-│  • 1×1 Conv unprojection: N=64 → 129 frequency bins                 │
-│  • Reconstruct complex STFT: magnitude × e^(j·θ_mixture)            │
+│  • Direct Inverse STFT on reconstructed complex spectrum Ŝ_target    │
+│  • Eliminates mixture-phase contamination and phase distortion       │
 │  • Inverse STFT → waveform trimmed to original input length          │
 └──────────────────────────────┬───────────────────────────────────────┘
                                │
@@ -246,17 +249,15 @@ Mixed Audio x(t)        │                                                │
 
 ## 🔬 Key Concepts & Novelty
 
-### 1. Neuromodulatory FiLM Conditioning
+### 1. Multi-Scale Deep FiLM & Trainable Speaker Adapter
 
-Feature-wise Linear Modulation applies a speaker-aware **affine transform** to the SNN bottleneck at every simulation timestep:
-
-```
-x_modulated = x × γ(e_target) + β(e_target)
-```
-
-- **γ** ∈ [0, 2] — gain gate (sigmoid-scaled): boosts spectral regions where the target speaker dominates
-- **β** — bias shift: suppresses frequency bands dominated by interfering speakers
-- Both derived from a single linear projection `Linear(192 → 256)` of the ECAPA-TDNN voiceprint
+- **Trainable Speaker Adapter**: A residual MLP (`Linear(192->256) -> LayerNorm -> PReLU -> Linear(256->192)`) adapts the frozen ECAPA-TDNN verification vector specifically for target speech extraction. Starts near exact identity and optimizes end-to-end.
+- **Deep Multi-Scale FiLM**: Rather than modulating only at the bottleneck, the adapted voiceprint dynamically scales $\gamma_i$ and shifts $\beta_i$ across **all 12 dilated spiking TCN blocks**:
+  ```
+  x_i,modulated = x_i × γ_i(e_adapted) + β_i(e_adapted)
+  ```
+  - **Early blocks (dilations 1, 2)**: Speaker-gates fine phoneme and pitch harmonics.
+  - **Deeper blocks (dilations 16, 32)**: Speaker-gates long-range speech cadence and pauses.
 
 ### 2. PLIF Neurons — Learnable Membrane Dynamics
 
